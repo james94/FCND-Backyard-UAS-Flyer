@@ -417,7 +417,9 @@ The arbiter selects which action stream drives the vehicle.
 
 ### 5.2 Arbiter output
 
-- Authoritative intent: `/vehicle/intent` (type `CommandIntent`)
+- Authoritative intent: `vehicle/command_intent` (type `CommandIntent`)
+
+Note: this matches the topic used by the baseline ROS2 guide in `SOLUTION_ROS2_JAZZY_CPP.md`.
 
 ### 5.3 Source sketch
 
