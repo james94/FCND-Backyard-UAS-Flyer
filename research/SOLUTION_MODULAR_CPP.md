@@ -864,6 +864,74 @@ int main() {
 	rx.join();
 	return 0;
 }
+
+### 9.1.1 `main.cpp` wiring for the UdaciDrone bridge (BridgeVehicle)
+
+Once you implement `BridgeTransport` + `BridgeVehicle` (Section 12.4), the placeholder receiver thread becomes:
+
+- a thread inside `BridgeTransport` that reads telemetry JSONL from Python
+- a `BridgeVehicle` that sends command JSONL to Python
+
+Minimal wiring sketch:
+
+```cpp
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+
+#include "backyard/config.hpp"
+#include "backyard/controller.hpp"
+#include "backyard/telemetry.hpp"
+
+#include "bridge_transport.hpp"
+#include "bridge_vehicle.hpp"
+
+int main() {
+	backyard::Config cfg;
+
+	std::mutex m;
+	backyard::TelemetrySample latest;
+	bool has_sample = false;
+
+	BridgeTransport transport;
+	transport.Connect("127.0.0.1", 9002);
+	transport.StartTelemetryThread([&](const backyard::TelemetrySample& s) {
+		std::lock_guard<std::mutex> lk(m);
+		latest = s;
+		has_sample = true;
+	});
+
+	BridgeVehicle vehicle(transport);
+	backyard::BackyardFlyerController controller(cfg, vehicle);
+	controller.StartMission();
+
+	const auto period = std::chrono::duration<double>(1.0 / cfg.control_rate_hz);
+	auto next = std::chrono::steady_clock::now();
+
+	while (controller.in_mission()) {
+		next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+
+		backyard::TelemetrySample local;
+		bool ok = false;
+		{
+			std::lock_guard<std::mutex> lk(m);
+			ok = has_sample;
+			local = latest;
+		}
+		if (ok) {
+			controller.UpdateTelemetry(local);
+			controller.Tick();
+		}
+		std::this_thread::sleep_until(next);
+	}
+
+	// Ask the Python bridge to shut down cleanly.
+	vehicle.Stop();
+	transport.Close();
+	return 0;
+}
+```
 ```
 
 ### 9.2 Build + run the app (commands)
@@ -914,4 +982,494 @@ You can now implement either:
 2) MavsdkVehicle: best if you are targeting SITL/real PX4 and want a production-friendly C++ stack.
 
 The controller core you wrote above should not change.
+
+---
+
+## 12) Unity simulator integration via Python `udacidrone` (practical bridge)
+
+This guide intentionally kept transport out of the C++ core.
+
+However, if your immediate goal is:
+
+- “Run the **C++ controller** against the Udacity **Unity simulator**”
+
+…then you need a bridge, because `udacidrone` is Python-first.
+
+### 12.1 High-level design
+
+Run two processes:
+
+1) **Python bridge** (uses `udacidrone`): connects to Unity MAVLink and exposes a small TCP server.
+2) **C++ app**: runs your fixed-rate loop and uses a `BridgeVehicle` adapter to send commands over TCP.
+
+Key boundary rule:
+
+- Your C++ core uses NED (`down_m`).
+- UdaciDrone `Drone.cmd_position(north, east, altitude, heading)` uses **altitude-up**.
+- Therefore the adapter/bridge must translate: `altitude_m = -down_m`.
+
+### 12.2 Minimal JSONL protocol
+
+Use JSON Lines (one JSON object per line) over a single TCP socket.
+
+C++ → Python (commands):
+
+```json
+{"type":"cmd","name":"take_control"}
+{"type":"cmd","name":"arm"}
+{"type":"cmd","name":"takeoff","altitude_m":3.0}
+{"type":"cmd","name":"cmd_position","north_m":10.0,"east_m":0.0,"down_m":-3.0,"heading_rad":0.0}
+{"type":"cmd","name":"land"}
+{"type":"cmd","name":"disarm"}
+{"type":"cmd","name":"release_control"}
+{"type":"cmd","name":"stop"}
+```
+
+Python → C++ (telemetry snapshots):
+
+```json
+{"type":"telemetry","t_us":1700000001123456,
+ "armed":true,"guided":true,
+ "local_position_ned_m":[1.2,0.3,-3.0],
+ "local_velocity_ned_mps":[0.1,0.0,0.0]}
+```
+
+This is intentionally minimal; you can extend later (global position, status, etc.).
+
+### 12.3 Python bridge sketch (UdaciDrone + threaded connection)
+
+This is a sketch you can put into `bridge/python/udacidrone_bridge_server.py`.
+
+Notes:
+
+- Use `threaded=True` so `conn.start()` does not block.
+- Stream telemetry at a bounded rate (e.g., 20–50 Hz).
+- Apply the `down_m → altitude_m` conversion only at the `Drone.cmd_position(...)` call.
+
+```python
+from __future__ import annotations
+
+import json
+import socket
+import threading
+import time
+
+from udacidrone import Drone
+from udacidrone.connection import MavlinkConnection
+
+
+def jsonl_send(sock: socket.socket, obj: dict) -> None:
+	data = (json.dumps(obj) + "\n").encode("utf-8")
+	sock.sendall(data)
+
+
+def main() -> None:
+	# Unity sim default: tcp:127.0.0.1:5760
+	conn = MavlinkConnection("tcp:127.0.0.1:5760", threaded=True, PX4=False)
+	drone = Drone(conn)
+
+	# Start MAVLink receive loop in the background.
+	conn.start()
+	# Give it a moment to populate telemetry.
+	time.sleep(1.0)
+
+	server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+	server.bind(("127.0.0.1", 9002))
+	server.listen(1)
+	print("Bridge listening on 127.0.0.1:9002")
+
+	client, addr = server.accept()
+	print("Client connected:", addr)
+	client.settimeout(0.1)
+
+	running = True
+
+	def telemetry_loop() -> None:
+		while running:
+			lp = drone.local_position.tolist()
+			lv = drone.local_velocity.tolist()
+			jsonl_send(
+				client,
+				{
+					"type": "telemetry",
+					"t_us": int(time.time() * 1e6),
+					"armed": bool(drone.armed),
+					"guided": bool(drone.guided),
+					"local_position_ned_m": lp,
+					"local_velocity_ned_mps": lv,
+				},
+			)
+			time.sleep(0.02)  # 50 Hz
+
+	threading.Thread(target=telemetry_loop, daemon=True).start()
+
+	buf = b""
+	try:
+		while True:
+			try:
+				chunk = client.recv(4096)
+			except socket.timeout:
+				continue
+			if not chunk:
+				break
+			buf += chunk
+			while b"\n" in buf:
+				line, buf = buf.split(b"\n", 1)
+				line = line.strip()
+				if not line:
+					continue
+				cmd = json.loads(line.decode("utf-8"))
+				if cmd.get("type") != "cmd":
+					continue
+
+				name = cmd.get("name")
+				if name == "take_control":
+					drone.take_control()
+				elif name == "release_control":
+					drone.release_control()
+				elif name == "arm":
+					drone.arm()
+				elif name == "disarm":
+					drone.disarm()
+				elif name == "takeoff":
+					drone.takeoff(float(cmd["altitude_m"]))
+				elif name == "land":
+					drone.land()
+				elif name == "cmd_position":
+					n = float(cmd["north_m"])
+					e = float(cmd["east_m"])
+					d = float(cmd["down_m"])  # NED
+					heading = float(cmd.get("heading_rad", 0.0))
+					alt = -d  # IMPORTANT: UdaciDrone cmd_position uses altitude-up
+					drone.cmd_position(n, e, alt, heading)
+				elif name == "stop":
+					drone.stop()
+					return
+	finally:
+		running = False
+		try:
+			client.close()
+		finally:
+			server.close()
+			drone.stop()
+
+
+if __name__ == "__main__":
+	main()
+```
+
+### 12.4 C++ adapter mapping (BridgeVehicle)
+
+Your `IVehicle` stays NED-oriented:
+
+- `CmdPosition(const NED& ned, heading)` uses `ned.down`.
+
+BridgeVehicle mapping to the wire protocol:
+
+- `Takeoff(target_altitude_m)` → send `{name:"takeoff", altitude_m: target_altitude_m}`
+- `CmdPosition(ned, heading)` → send `{name:"cmd_position", north_m: ned.north, east_m: ned.east, down_m: ned.down, heading_rad: heading}`
+
+The Python side performs the only required translation for UdaciDrone:
+
+- `altitude_m = -down_m` when calling `Drone.cmd_position(...)`.
+
+### 12.4.1 C++ implementation: `BridgeTransport` + `BridgeVehicle`
+
+Below is a minimal Linux/POSIX implementation that:
+
+- opens a TCP connection to the Python bridge (default `127.0.0.1:9002`)
+- sends command JSONL lines
+- reads telemetry JSONL lines on a background thread and converts them to `backyard::TelemetrySample`
+
+This intentionally uses a small JSON library to keep parsing safe.
+
+#### Add a JSON header (single file)
+
+Vendor `nlohmann/json.hpp` under:
+
+`cpp/backyard_flyer_app/third_party/nlohmann/json.hpp`
+
+You can download the single-header release from the nlohmann/json project.
+
+#### `cpp/backyard_flyer_app/src/bridge_transport.hpp`
+
+```cpp
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include "backyard/telemetry.hpp"
+
+class BridgeTransport {
+ public:
+	BridgeTransport() = default;
+	~BridgeTransport();
+
+	BridgeTransport(const BridgeTransport&) = delete;
+	BridgeTransport& operator=(const BridgeTransport&) = delete;
+
+	void Connect(const std::string& host, int port);
+	void Close();
+
+	void SendLine(const std::string& line);
+	void StartTelemetryThread(std::function<void(const backyard::TelemetrySample&)> on_sample);
+
+ private:
+	std::string ReadLineBlocking();
+
+	int fd_{-1};
+	std::mutex send_mu_;
+
+	std::atomic<bool> running_{false};
+	std::thread rx_;
+};
+```
+
+#### `cpp/backyard_flyer_app/src/bridge_transport.cpp`
+
+```cpp
+#include "bridge_transport.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
+
+#include "third_party/nlohmann/json.hpp"
+
+using nlohmann::json;
+
+BridgeTransport::~BridgeTransport() {
+	Close();
+}
+
+void BridgeTransport::Connect(const std::string& host, int port) {
+	if (fd_ != -1) {
+		throw std::runtime_error("BridgeTransport already connected");
+	}
+
+	fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+	if (fd_ < 0) {
+		throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+	}
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(static_cast<uint16_t>(port));
+	if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+		::close(fd_);
+		fd_ = -1;
+		throw std::runtime_error("inet_pton failed for host: " + host);
+	}
+
+	if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+		::close(fd_);
+		fd_ = -1;
+		throw std::runtime_error(std::string("connect failed: ") + std::strerror(errno));
+	}
+}
+
+void BridgeTransport::Close() {
+	running_.store(false);
+	if (rx_.joinable()) {
+		rx_.join();
+	}
+	if (fd_ != -1) {
+		::shutdown(fd_, SHUT_RDWR);
+		::close(fd_);
+		fd_ = -1;
+	}
+}
+
+void BridgeTransport::SendLine(const std::string& line) {
+	if (fd_ == -1) {
+		throw std::runtime_error("SendLine called while not connected");
+	}
+
+	std::lock_guard<std::mutex> lk(send_mu_);
+	const std::string data = line + "\n";
+	const char* p = data.data();
+	size_t remaining = data.size();
+	while (remaining > 0) {
+		const ssize_t n = ::send(fd_, p, remaining, 0);
+		if (n < 0) {
+			throw std::runtime_error(std::string("send failed: ") + std::strerror(errno));
+		}
+		p += static_cast<size_t>(n);
+		remaining -= static_cast<size_t>(n);
+	}
+}
+
+std::string BridgeTransport::ReadLineBlocking() {
+	if (fd_ == -1) {
+		throw std::runtime_error("ReadLineBlocking called while not connected");
+	}
+
+	std::string out;
+	out.reserve(256);
+	while (true) {
+		char c = 0;
+		const ssize_t n = ::recv(fd_, &c, 1, 0);
+		if (n == 0) {
+			throw std::runtime_error("bridge socket closed");
+		}
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
+		}
+		if (c == '\n') {
+			return out;
+		}
+		out.push_back(c);
+	}
+}
+
+void BridgeTransport::StartTelemetryThread(std::function<void(const backyard::TelemetrySample&)> on_sample) {
+	if (running_.exchange(true)) {
+		throw std::runtime_error("telemetry thread already running");
+	}
+
+	rx_ = std::thread([this, cb = std::move(on_sample)]() {
+		while (running_.load()) {
+			const std::string line = ReadLineBlocking();
+			if (line.empty()) continue;
+
+			json j = json::parse(line);
+			if (j.value("type", "") != "telemetry") continue;
+
+			backyard::TelemetrySample s;
+			s.t_us = j.value("t_us", static_cast<uint64_t>(0));
+			s.armed = j.value("armed", false);
+			s.guided = j.value("guided", false);
+
+			const auto lp = j.at("local_position_ned_m");
+			s.position_ned.north = lp.at(0).get<double>();
+			s.position_ned.east = lp.at(1).get<double>();
+			s.position_ned.down = lp.at(2).get<double>();
+
+			const auto lv = j.at("local_velocity_ned_mps");
+			s.velocity_ned.north = lv.at(0).get<double>();
+			s.velocity_ned.east = lv.at(1).get<double>();
+			s.velocity_ned.down = lv.at(2).get<double>();
+
+			cb(s);
+		}
+	});
+}
+```
+
+#### `cpp/backyard_flyer_app/src/bridge_vehicle.hpp`
+
+```cpp
+#pragma once
+
+#include "backyard/types.hpp"
+#include "backyard/vehicle.hpp"
+
+#include "bridge_transport.hpp"
+
+class BridgeVehicle final : public backyard::IVehicle {
+ public:
+	explicit BridgeVehicle(BridgeTransport& t) : t_(t) {}
+
+	void TakeControl() override;
+	void ReleaseControl() override;
+	void Arm() override;
+	void Disarm() override;
+	void Takeoff(double target_altitude_m) override;
+	void Land() override;
+	void CmdPosition(const backyard::NED& ned, double heading_rad) override;
+	void Stop() override;
+
+ private:
+	BridgeTransport& t_;
+};
+```
+
+#### `cpp/backyard_flyer_app/src/bridge_vehicle.cpp`
+
+```cpp
+#include "bridge_vehicle.hpp"
+
+#include <sstream>
+
+// Minimal JSON construction (keep it simple; bridge server is strict).
+// If you prefer, you can also build JSON via nlohmann::json and dump().
+
+static std::string cmd0(const char* name) {
+	std::ostringstream os;
+	os << "{\"type\":\"cmd\",\"name\":\"" << name << "\"}";
+	return os.str();
+}
+
+void BridgeVehicle::TakeControl() {
+	t_.SendLine(cmd0("take_control"));
+}
+
+void BridgeVehicle::ReleaseControl() {
+	t_.SendLine(cmd0("release_control"));
+}
+
+void BridgeVehicle::Arm() {
+	t_.SendLine(cmd0("arm"));
+}
+
+void BridgeVehicle::Disarm() {
+	t_.SendLine(cmd0("disarm"));
+}
+
+void BridgeVehicle::Takeoff(double target_altitude_m) {
+	std::ostringstream os;
+	os << "{\"type\":\"cmd\",\"name\":\"takeoff\",\"altitude_m\":" << target_altitude_m << "}";
+	t_.SendLine(os.str());
+}
+
+void BridgeVehicle::Land() {
+	t_.SendLine(cmd0("land"));
+}
+
+void BridgeVehicle::CmdPosition(const backyard::NED& ned, double heading_rad) {
+	std::ostringstream os;
+	os << "{\"type\":\"cmd\",\"name\":\"cmd_position\""
+	   << ",\"north_m\":" << ned.north
+	   << ",\"east_m\":" << ned.east
+	   << ",\"down_m\":" << ned.down
+	   << ",\"heading_rad\":" << heading_rad
+	   << "}";
+	t_.SendLine(os.str());
+}
+
+void BridgeVehicle::Stop() {
+	// Ask python bridge to shut down. It will close socket.
+	t_.SendLine(cmd0("stop"));
+}
+```
+
+Notes:
+
+- `BridgeVehicle::CmdPosition(...)` sends `down_m` exactly as produced by your C++ core.
+- The Python bridge converts `down_m` to altitude-up for UdaciDrone using `altitude_m = -down_m`.
+- `Stop()` is optional but convenient for clean shutdown.
+
+### 12.5 What this bridge gives you (and what it doesn’t)
+
+Gives you:
+
+- ability to regression-test your C++ core logic inside Unity without rewriting `udacidrone` in C++
+
+Doesn’t give you (yet):
+
+- production-grade transport, hard real-time guarantees, or multi-vehicle routing
+
+That’s fine: this bridge is a migration tool, not the final transport.
 

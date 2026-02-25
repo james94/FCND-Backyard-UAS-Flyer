@@ -88,6 +88,64 @@ MVP recommendation:
 - If you are still using the Udacity Unity sim: start with the **bridge** approach.
 - If your goal is true real-time + production-ish: choose **MAVSDK**.
 
+#### Step 2A — Unity simulator integration using Python `udacidrone` (bridge)
+
+If you want to validate your **C++ controller core** in the same Unity simulator that already works with Python `udacidrone`, the most practical integration is:
+
+- Run a small **Python bridge** process that:
+	- connects to Unity via `udacidrone.connection.MavlinkConnection('tcp:127.0.0.1:5760', threaded=True, PX4=False)`
+	- owns a `udacidrone.Drone`
+	- exposes a tiny TCP server to accept high-level commands from C++
+	- streams telemetry snapshots to C++
+
+- Run the C++ app that:
+	- executes the fixed-rate control loop (`Tick()`)
+	- implements `IVehicle` as a **BridgeVehicle** that sends commands to the Python bridge
+
+Why this works well:
+
+- `udacidrone` already handles the Unity MAVLink details.
+- Your C++ core remains transport-agnostic.
+- You put all “frame/sign/API quirks” in the adapter boundary.
+
+Bridge protocol (minimum viable): JSON lines over TCP.
+
+- C++ → Python commands (one JSON object per line):
+
+```json
+{"type":"cmd","name":"take_control"}
+{"type":"cmd","name":"arm"}
+{"type":"cmd","name":"takeoff","altitude_m":3.0}
+{"type":"cmd","name":"cmd_position","north_m":10.0,"east_m":0.0,"down_m":-3.0,"heading_rad":0.0}
+{"type":"cmd","name":"land"}
+{"type":"cmd","name":"disarm"}
+{"type":"cmd","name":"release_control"}
+```
+
+- Python → C++ telemetry stream (one JSON object per line at ~20–50 Hz):
+
+```json
+{"type":"telemetry","t_us":1700000001123456,
+ "armed":true,"guided":true,
+ "local_position_ned_m":[1.2,0.3,-3.0],
+ "local_velocity_ned_mps":[0.1,0.0,0.0]}
+```
+
+Command/Frame mapping (avoid the bug you hit in Python):
+
+- `udacidrone.Drone.local_position` is NED (down is negative when above home).
+- `udacidrone.Drone.cmd_position(north, east, altitude, heading)` expects **altitude-up**.
+- Your C++ core can stay in NED (`down_m`), and the **bridge** should translate:
+	- `altitude_m = -down_m` before calling `Drone.cmd_position(...)`.
+
+Threading note:
+
+- `MavlinkConnection(threaded=False)` is blocking; for a bridge you almost always want `threaded=True` so the Python process can both (a) receive MAVLink and (b) service the TCP socket.
+
+Concrete C++ adapter code:
+
+- `BridgeTransport` (TCP + JSONL) and `BridgeVehicle` (implements `IVehicle`) are provided as follow-along listings in `research/SOLUTION_MODULAR_CPP.md` Section 12.4.1.
+
 ### Step 3 — Implement the same state machine core in C++
 
 Port the Python architecture *as-is*:

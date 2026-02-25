@@ -117,23 +117,34 @@ FCND-Backyard-UAS-Flyer/
 	bridge/
 		python/
 			README.md
-			bridge_server.py              # reads UdaciDrone state; exposes to C++ (TCP/UDP)
+			udacidrone_bridge_server.py   # uses udacidrone + MavlinkConnection; exposes TCP JSONL bridge to C++
 			bridge_protocol.md            # message schemas
+			requirements.txt              # udacidrone deps (and any extra libs)
 			scripts/
-				run_bridge.sh
+				run_bridge.sh                # starts Unity bridge (threaded=True) on localhost
 	cpp/
 		backyard_flyer_app/
 			CMakeLists.txt
 			src/
 				main.cpp                    # wires transport + controller + fixed-rate loop
-				bridge_vehicle.cpp          # implements IVehicle
+				bridge_transport.hpp
 				bridge_transport.cpp        # socket client
+				bridge_vehicle.hpp
+				bridge_vehicle.cpp          # implements IVehicle
+			third_party/
+				nlohmann/
+					json.hpp
 ```
 
 Benefits:
 
 - Fastest path to prove the C++ controller can fly the box in the same simulator.
 - Lets you keep UdaciDrone simulator expectations isolated to `bridge/python/`.
+
+Key interface choice:
+
+- Keep the C++ core NED-oriented.
+- If UdaciDrone commands require altitude-up (e.g., `Drone.cmd_position(n,e,altitude,heading)`), do the `down → altitude` translation inside the Python bridge or the adapter layer.
 
 #### Stage 2B (production-ish): MAVSDK (or MAVLink C)
 
@@ -282,19 +293,26 @@ FCND-Backyard-UAS-Flyer/
 			CMakeLists.txt
 			src/
 				main.cpp
-				# choose one (or both) during migration:
+				bridge_transport.hpp
+				bridge_transport.cpp
+				bridge_vehicle.hpp
 				bridge_vehicle.cpp
+				# choose one (or both) during migration:
 				mavsdk_vehicle.cpp
 				mavlink_vehicle.cpp
+			third_party/
+				nlohmann/
+					json.hpp
 			scripts/
 				run_app.sh
 
-	# Migration bridge (only if needed for Unity sim)
+	# Python bridge (keeps Unity/UdaciDrone integration stable while you migrate C++)
 	bridge/
 		python/
 			README.md
-			bridge_server.py
+			udacidrone_bridge_server.py
 			bridge_protocol.md
+			requirements.txt
 			scripts/
 				run_bridge.sh
 
