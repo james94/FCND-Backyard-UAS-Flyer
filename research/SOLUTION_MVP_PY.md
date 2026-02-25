@@ -26,7 +26,12 @@ So “3 meters altitude” (3m above takeoff point) corresponds to:
 
 - `down = -3.0`
 
-That sign is the most common source of bugs: if you command `down = +3.0` you will try to go underground.
+Important nuance for this project:
+
+- **Telemetry** is NED. At 3m altitude, you should observe `self.local_position[2] ≈ -3.0`.
+- **Commands**: UdaciDrone `cmd_position(north, east, altitude, heading)` expects **altitude-up (positive)**.
+	- Command `altitude = +3.0` for “3m up”.
+	- Do **not** pass `down = -3.0` into `cmd_position()`; that mismatch commonly causes the vehicle to descend during waypoint flight.
 
 ### 2.2 Event-driven control loop
 
@@ -59,8 +64,8 @@ In the starter, “command on entry” is implemented via transition methods:
 ### 3.2 Data model (minimum)
 
 - `self.flight_state`: current `States` enum value
-- `self.target_position`: current commanded local NED target `[north, east, down]`
-- `self.all_waypoints`: queue/list of waypoints remaining (each waypoint is `[north, east, down]`)
+- `self.target_position`: current commanded target for `cmd_position()` as `[north, east, altitude]`
+- `self.all_waypoints`: queue/list of remaining waypoints (each waypoint is `[north, east, altitude]`)
 - `self.in_mission`: stops the mission when `False`
 
 Optionally add small constants:
@@ -84,7 +89,7 @@ These three callbacks are enough for an MVP.
 
 ### Step 1 — Implement `calculate_box()` to generate the 10m square
 
-Goal: return waypoints for a square path **relative to the current local position**, at constant `down = -3.0`.
+Goal: return waypoints for a square path **relative to the current local position**, at constant `altitude = 3.0` (altitude-up).
 
 MVP approach:
 
@@ -94,12 +99,12 @@ MVP approach:
 
 2) Build a closed square (end where you started):
 
-- Corner 1: `(north0 + 10, east0 + 0, -3)`
-- Corner 2: `(north0 + 10, east0 + 10, -3)`
-- Corner 3: `(north0 + 0,  east0 + 10, -3)`
-- Corner 4: `(north0 + 0,  east0 + 0,  -3)`
+- Corner 1: `(north0 + 10, east0 + 0, 3)`
+- Corner 2: `(north0 + 10, east0 + 10, 3)`
+- Corner 3: `(north0 + 0,  east0 + 10, 3)`
+- Corner 4: `(north0 + 0,  east0 + 0,  3)`
 
-3) Return as a Python list of `np.array([n, e, d])`.
+3) Return as a Python list of `np.array([n, e, altitude])`.
 
 Design note: Keeping the square “anchored” to the takeoff point makes it robust even if you start from a different place in the map.
 
@@ -123,7 +128,7 @@ Why set home? It establishes a consistent reference for local coordinates and fo
 
 Entry action:
 
-1) Set `self.target_position = [current_north, current_east, -3.0]`.
+1) Set `self.target_position = [current_north, current_east, 3.0]`.
 2) `self.takeoff(3.0)` (API uses “altitude” in meters; the Drone handles the underlying frame).
 3) `self.flight_state = States.TAKEOFF`
 
@@ -134,7 +139,7 @@ Entry action:
 1) Pop the next waypoint from `self.all_waypoints`.
 2) Set `self.target_position = waypoint`.
 3) Command it:
-	 - `self.cmd_position(north, east, down, heading)`
+	 - `self.cmd_position(north, east, altitude, heading)`
 	 - Use `heading = 0.0` for MVP unless you want to yaw along the path.
 4) `self.flight_state = States.WAYPOINT`
 
@@ -223,7 +228,8 @@ This helps avoid disarming while still descending or sliding.
 
 ## 7) Common pitfalls (and the MVP fixes)
 
-- **NED sign error**: altitude is `-down`. Always command `down = -3.0` for 3m up.
+- **Telemetry-vs-command mismatch**: telemetry is NED (`altitude = -down`), but `cmd_position()` expects altitude-up.
+	- Observe ~3m up as `self.local_position[2] ≈ -3.0`, but command `self.cmd_position(..., altitude=3.0, ...)`.
 - **No tolerance**: exact equality on floating sensors never triggers; use `POS_TOL` and thresholds like `0.95 * altitude`.
 - **Command spam**: don’t re-send commands every callback tick; only send on state transitions.
 - **Landing disarm too early**: require near-ground + low velocity before disarming.

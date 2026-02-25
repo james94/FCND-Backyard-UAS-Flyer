@@ -75,7 +75,9 @@ For samples:
 }
 ```
 
-NED reminder (from `README.md`): target altitude 3m means `down = -3.0`.
+NED reminder (from `README.md`): in telemetry, target altitude 3m means `down = -3.0`.
+
+Command reminder: this does not imply your command API takes NED down; some APIs (like UdaciDrone `cmd_position`) take altitude-up.
 
 ---
 

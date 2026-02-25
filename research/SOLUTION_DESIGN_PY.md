@@ -38,6 +38,12 @@ So a target altitude of 3 meters above ground is:
 
 - `target_down = -3.0`
 
+Important nuance for this project:
+
+- **Telemetry** (`self.local_position`) is NED, so 3m altitude corresponds to `down = -3.0`.
+- **Commands**: UdaciDrone `cmd_position(north, east, altitude, heading)` expects **altitude-up (positive)**.
+	- A common bug is sending `down=-3.0` to `cmd_position()`, which causes the vehicle to descend during waypoint flight.
+
 ### 2.2 The controller is event-driven
 
 You do not poll in a tight loop. Your “control loop” is:
@@ -118,7 +124,7 @@ Guard to leave ARMING:
 
 Entry behavior:
 
-- set `target_position` to current north/east and `down = -3.0`
+- set `target_position` to current north/east and `altitude = 3.0`
 - command `takeoff(3.0)`
 - `flight_state = TAKEOFF`
 
@@ -132,7 +138,7 @@ Entry behavior:
 
 - generate the box waypoints once (`calculate_box`) if not already, storing them in `self.all_waypoints`
 - pop the next waypoint from `self.all_waypoints`
-- send `cmd_position(north, east, down, heading)`
+- send `cmd_position(north, east, altitude, heading)`
 - `flight_state = WAYPOINT`
 
 Guard to leave WAYPOINT:
@@ -168,6 +174,8 @@ Requirement: a **10m box** at **3m altitude**.
 Minimal design:
 
 - Use the current local position as the origin reference `(n0, e0)`.
+- Waypoints should use **altitude-up (positive)** for `cmd_position` (e.g., `altitude = 3.0`).
+	- You still use NED `down=-3.0` only when interpreting `local_position`.
 - Generate 4 corners (and optionally return to start):
 
 1) `(n0 + 10, e0 + 0,  -3)`
@@ -281,7 +289,8 @@ Once the MVP works, the most valuable engineering step is to separate concerns.
 	- box size, altitude, tolerances, headings
 
 2) **Waypoint planner** (`planner.py`)
-	- `build_box(origin_ne, box_size, altitude_down) -> list[Waypoint]`
+	- `build_box(origin_ne, box_size, altitude_m) -> list[Waypoint]`
+	  - Plan waypoints using **altitude-up** (matches `cmd_position`), and interpret telemetry altitude as `-local_position[2]`.
 
 3) **State machine core** (`state_machine.py`)
 	- pure functions for guards:

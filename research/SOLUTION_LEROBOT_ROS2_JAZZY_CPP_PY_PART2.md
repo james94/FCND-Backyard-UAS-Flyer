@@ -282,6 +282,8 @@ Goal: train a policy $\pi(o_t) \approx a_t$ that mimics the classical controller
 For safety and learnability, imitate only one command type initially:
 
 - `CMD_POSITION` targets (north/east/down/heading)
+	- Here `down` is the **NED** coordinate used in your internal/ROS2 messages.
+	- If the final actuator API expects altitude-up (e.g., UdaciDrone `cmd_position`), translate in the vehicle interface node/adapter.
 
 Keep classical FSM in charge of:
 

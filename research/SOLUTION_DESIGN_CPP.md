@@ -47,7 +47,12 @@ Crucially: “Real-time performance based” does *not* mean “NiFi in the cont
 Reference frame reminder:
 
 - Local frame is **NED**.
-- Altitude of 3m above ground corresponds to `down = -3.0`.
+- Altitude of 3m above ground corresponds to `down = -3.0` **in NED telemetry**.
+
+Command reminder (to prevent a common regression when bridging back to UdaciDrone/sim APIs):
+
+- Some command APIs take **altitude-up**, not NED down. For example, UdaciDrone `cmd_position(north, east, altitude, heading)` expects altitude-up.
+- Keep your C++ core consistent (e.g., NED everywhere internally) and do the translation in the vehicle/adapter layer.
 
 ---
 

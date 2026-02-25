@@ -19,7 +19,8 @@ Inputs re-analyzed:
 Mission reminder:
 
 - Fly a **10m box** at **3m altitude** and land/disarm.
-- Local frame is **NED**, so target altitude 3m means `down = -3.0`.
+- Local frame is **NED** (telemetry), so target altitude 3m means `down = -3.0`.
+	- Keep command translation in the controller/vehicle adapter; MiNiFi only ships logs/ops events.
 
 ---
 

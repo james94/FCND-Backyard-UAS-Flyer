@@ -14,7 +14,8 @@ Source alignment:
 Mission reminder:
 
 - Fly a **10m box** at **3m altitude**, then land/disarm/end mission.
-- Local frame is **NED**; altitude “up” corresponds to `down = -3.0`.
+- Local frame is **NED**; altitude “up” corresponds to `down = -3.0` **in telemetry**.
+	- If your vehicle command API expects altitude-up (like UdaciDrone `cmd_position`), translate in the adapter layer.
 
 README note about “manual flight first”:
 
@@ -890,7 +891,7 @@ Key “real-time-ish” choices:
 - Compile core + run unit tests.
 - Confirm:
 	- `BuildBox()` generates the correct four corners.
-	- NED sign is correct (`down = -3.0`).
+	- NED sign is correct in telemetry/internal math (`down = -3.0` corresponds to 3m altitude).
 	- Controller produces exactly 4 waypoint commands, then `Land()`, then `Disarm()`, then `ReleaseControl()` + `Stop()`.
 
 ### 10.2 Integration validation (sim / SITL)

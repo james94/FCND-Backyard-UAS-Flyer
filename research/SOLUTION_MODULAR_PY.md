@@ -8,7 +8,10 @@ It is intentionally:
 - Testable (planner + guards are pure functions/classes)
 - Portable (UdaciDrone specifics live behind a small adapter)
 
-> Reminder on frames: local position is **NED**; “3m altitude” means `down = -3.0`.
+> Reminder on frames: `local_position` is **NED** (so at 3m altitude, `down = -3.0`).
+> 
+> **Important:** UdaciDrone’s `cmd_position(north, east, altitude, heading)` expects **altitude-up (positive)**.
+> If you pass `down=-3.0` into `cmd_position()`, the vehicle will try to descend during waypoint flight.
 
 ---
 
@@ -120,7 +123,16 @@ class NED:
 		return NED(float(v[0]), float(v[1]), float(v[2]))
 
 
-Waypoint = NED
+@dataclass(frozen=True)
+class Waypoint:
+	"""Waypoint in local N/E with altitude-up (meters).
+
+	This matches UdaciDrone `cmd_position()` which takes altitude (not NED down).
+	"""
+
+	north: float
+	east: float
+	altitude_m: float
 ```
 
 You can keep using `np.array` everywhere if you prefer; the key is consistency.
@@ -146,14 +158,13 @@ class BoxPlanner:
 	cfg: MissionConfig
 
 	def build_box(self, origin_north: float, origin_east: float) -> List[Waypoint]:
-		down = -self.cfg.target_altitude_m
 		s = self.cfg.box_size_m
 
 		return [
-			Waypoint(origin_north + s, origin_east + 0.0, down),
-			Waypoint(origin_north + s, origin_east + s, down),
-			Waypoint(origin_north + 0.0, origin_east + s, down),
-			Waypoint(origin_north + 0.0, origin_east + 0.0, down),
+			Waypoint(origin_north + s, origin_east + 0.0, self.cfg.target_altitude_m),
+			Waypoint(origin_north + s, origin_east + s, self.cfg.target_altitude_m),
+			Waypoint(origin_north + 0.0, origin_east + s, self.cfg.target_altitude_m),
+			Waypoint(origin_north + 0.0, origin_east + 0.0, self.cfg.target_altitude_m),
 		]
 ```
 
@@ -175,7 +186,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .config import MissionConfig
-from .types import NED
+from .types import Waypoint
 
 
 @dataclass
@@ -187,7 +198,7 @@ class FlightGuards:
 		altitude = -float(local_position[2])
 		return altitude >= self.cfg.takeoff_altitude_ratio * self.cfg.target_altitude_m
 
-	def waypoint_reached(self, local_position: np.ndarray, target: NED) -> bool:
+	def waypoint_reached(self, local_position: np.ndarray, target: Waypoint) -> bool:
 		pos_ne = np.array([local_position[0], local_position[1]], dtype=float)
 		tgt_ne = np.array([target.north, target.east], dtype=float)
 		d = float(np.linalg.norm(pos_ne - tgt_ne))
@@ -221,6 +232,7 @@ class DroneLike(Protocol):
 	guided: bool
 	local_position: object
 	local_velocity: object
+	global_position: object
 
 	# commands
 	def arm(self) -> None: ...
@@ -229,7 +241,8 @@ class DroneLike(Protocol):
 	def release_control(self) -> None: ...
 	def takeoff(self, target_altitude: float) -> None: ...
 	def land(self) -> None: ...
-	def cmd_position(self, north: float, east: float, down: float, heading: float) -> None: ...
+	def cmd_position(self, north: float, east: float, altitude: float, heading: float) -> None: ...
+	def set_home_position(self, lon: float, lat: float, alt: float) -> None: ...
 	def stop(self) -> None: ...
 
 
@@ -241,11 +254,19 @@ class UdacidroneAdapter:
 		self.drone.take_control()
 		self.drone.arm()
 
+		# Matches many working Backyard Flyer solutions: set home to current global position.
+		# This helps ensure local frame behavior is consistent.
+		try:
+			gp = self.drone.global_position
+			self.drone.set_home_position(gp[0], gp[1], gp[2])
+		except Exception:
+			pass
+
 	def takeoff(self, altitude_m: float) -> None:
 		self.drone.takeoff(altitude_m)
 
-	def goto(self, north: float, east: float, down: float, heading: float) -> None:
-		self.drone.cmd_position(north, east, down, heading)
+	def goto(self, north: float, east: float, altitude_m: float, heading: float) -> None:
+		self.drone.cmd_position(north, east, altitude_m, heading)
 
 	def land(self) -> None:
 		self.drone.land()
@@ -284,7 +305,7 @@ from .adapter import UdacidroneAdapter
 from .config import MissionConfig
 from .guards import FlightGuards
 from .planner import BoxPlanner
-from .types import NED, Waypoint
+from .types import Waypoint
 
 
 class FlightState(Enum):
@@ -366,7 +387,7 @@ class BackyardFlyerFSM:
 		self.adapter.goto(
 			north=self.target.north,
 			east=self.target.east,
-			down=self.target.down,
+			altitude_m=self.target.altitude_m,
 			heading=self.cfg.heading_rad,
 		)
 		self.state = FlightState.WAYPOINT
@@ -472,7 +493,7 @@ def test_box_planner_returns_4_waypoints():
 	assert len(wps) == 4
 	assert wps[-1].north == 0.0
 	assert wps[-1].east == 0.0
-	assert wps[0].down == -3.0
+	assert wps[0].altitude_m == 3.0
 ```
 
 ### 4.2 `test_guards.py`
@@ -482,7 +503,7 @@ import numpy as np
 
 from backyard_flyer.config import MissionConfig
 from backyard_flyer.guards import FlightGuards
-from backyard_flyer.types import NED
+from backyard_flyer.types import Waypoint
 
 
 def test_altitude_reached_uses_ned_down_sign():
@@ -495,7 +516,7 @@ def test_altitude_reached_uses_ned_down_sign():
 def test_waypoint_reached_xy_only():
 	cfg = MissionConfig(pos_tolerance_m=0.5)
 	guards = FlightGuards(cfg)
-	target = NED(10.0, 0.0, -3.0)
+	target = Waypoint(10.0, 0.0, 3.0)
 	assert guards.waypoint_reached(np.array([10.2, 0.1, -3.0]), target)
 ```
 

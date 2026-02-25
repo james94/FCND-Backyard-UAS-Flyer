@@ -19,7 +19,8 @@ Inputs re-analyzed:
 Mission reminder:
 
 - Fly a **10m box** at **3m altitude**, then land/disarm/end mission.
-- Local frame is **NED**; 3m altitude corresponds to `down = -3.0`.
+- Local frame is **NED**; 3m altitude corresponds to `down = -3.0` in telemetry.
+  - Keep `CommandIntent`/control math internally consistent (often NED), and translate to your vehicle API (some use altitude-up).
 
 ---
 

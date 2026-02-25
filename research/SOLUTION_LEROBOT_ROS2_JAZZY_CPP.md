@@ -20,7 +20,8 @@ Inputs re-analyzed:
 Mission reminder:
 
 - Fly a **10m box** at **3m altitude**, then land/disarm/end mission.
-- Local frame is **NED**; 3m altitude corresponds to `down = -3.0`.
+- Local frame is **NED**; 3m altitude corresponds to `down = -3.0` in telemetry.
+	- Vehicle interfaces may use altitude-up commands; do that translation at the adapter boundary.
 
 ---
 

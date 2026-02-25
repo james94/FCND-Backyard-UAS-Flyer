@@ -51,7 +51,7 @@ Build:
 Done when:
 
 - Unity sim flies the **10m box at 3m altitude** and lands/disarms cleanly
-- you can explain why 3m altitude is `down = -3.0` in NED
+- you can explain why 3m altitude is `down = -3.0` in NED telemetry, but UdaciDrone `cmd_position()` expects altitude-up
 
 ### Step 2 — Modularize the mission (Python, class-based)
 
