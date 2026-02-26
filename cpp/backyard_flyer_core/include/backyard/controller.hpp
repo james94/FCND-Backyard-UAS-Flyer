@@ -12,7 +12,7 @@
 
 #include "backyard/config.hpp"
 #include "backyard/planner.hpp"
-#include "backyard/telemtry.hpp"
+#include "backyard/telemetry.hpp"
 #include "backyard/types.hpp"
 #include "backyard/vehicle.hpp"
 

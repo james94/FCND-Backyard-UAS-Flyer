@@ -1,6 +1,10 @@
 #include "backyard/controller.hpp"
 #include "backyard/guards.hpp"
 
+// NOTE: 
+// - This controller never sends commands "every tick"; only transitions send commands.
+// - The "WaypointTransition()" computes waypoints once, then commands one waypoint per transition.
+
 namespace backyard {
 
 BackyardFlyerController::BackyardFlyerController(const Config& cfg, IVehicle& vehicle)
@@ -87,12 +91,46 @@ void BackyardFlyerController::TakeoffTransition() {
 }
 
 // Continue onward
-void BackyardController::WaypointTransition() {
+void BackyardFlyerController::WaypointTransition() {
     if (!last_sample_.has_value()) {
         return;
     }
+
+    if(!has_plan_) {
+        const auto& s = *last_sample_;
+        waypoints_ = planner_.BuildBox(s.position_ned.north, s.position_ned.east);
+        waypoint_index_ = 0;
+        has_plan_ = true;
+    }
+
+    if (waypoint_index_ >= waypoints_.size()) {
+        LandingTransition();
+        return;
+    }
+
+    target_ = waypoints_[waypoint_index_];
+    waypoint_index_++;
+
+    vehicle_.CmdPosition(target_, cfg_.heading_rad);
+    SetState(FlightState::Waypoint);
 }
 
+void BackyardFlyerController::LandingTransition() {
+    vehicle_.Land();
+    SetState(FlightState::Landing);
+}
+
+void BackyardFlyerController::DisarmingTransition() {
+    vehicle_.Disarm();
+    SetState(FlightState::Disarming);
+}
+
+void BackyardFlyerController::ManualTransition() {
+    vehicle_.ReleaseControl();
+    vehicle_.Stop();
+    in_mission_ = false;
+    SetState(FlightState::Manual);
+}
 
 
 }

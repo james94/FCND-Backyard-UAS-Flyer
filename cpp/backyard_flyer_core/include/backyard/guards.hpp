@@ -16,6 +16,8 @@ inline double Norm2D(double x, double y) {
 inline bool AltitudeReached(const TelemetrySample& s, const Config& cfg) {
     // NED: down is negative when up
     const double altitude_m = -s.position_ned.down; 
+    
+    return altitude_m >= cfg.takeoff_ratio * cfg.target_altitude_m;
 }
 
 inline bool WaypointReachedXY(const TelemetrySample& s, const Config& cfg, const NED& target) {
