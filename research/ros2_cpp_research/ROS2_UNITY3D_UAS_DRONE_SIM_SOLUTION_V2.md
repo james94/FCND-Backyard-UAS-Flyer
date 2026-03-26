@@ -80,10 +80,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		ros-jazzy-moveit \
 		&& rm -rf /var/lib/apt/lists/*
 
-# Optional MAVLink development dependency (C implementation)
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-# 		libmavlink-dev \
-# 		&& rm -rf /var/lib/apt/lists/*
+# MAVLink and MAVROS packages (ROS2 Jazzy)
+# Use ROS packages on Ubuntu 24.04 because libmavlink-dev may be unavailable.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		ros-jazzy-mavlink \
+		ros-jazzy-libmavconn \
+		ros-jazzy-mavros-msgs \
+		ros-jazzy-mavros \
+		&& rm -rf /var/lib/apt/lists/*
 
 # Workspace setup
 RUN mkdir -p /opt/ws/src
@@ -151,6 +155,16 @@ ros2 --help
 ```
 
 If these commands pass, infrastructure is ready for modular C++ development.
+
+For MAVLink C++ validation in the container:
+
+```bash
+apt-cache search mavlink | grep -E "mavlink|mavros|mavconn"
+dpkg -l | grep -E "ros-jazzy-(mavlink|mavros|mavros-msgs|libmavconn)"
+ls /opt/ros/jazzy/include/mavros_msgs/mavlink_convert.hpp
+```
+
+Note: Some Jazzy images do not expose `mavlink/v2.0/common/mavlink.h` on the default include path. The driver implementation should rely on `mavros_msgs/mavlink_convert.hpp` and `libmavconn` headers instead of directly including `mavlink.h`.
 
 ## 2. Architecture Translation from Problem Statement
 
@@ -259,8 +273,8 @@ struct UasStateSnapshot
 Responsibility:
 
 1. Open/close simulator transport endpoint
-2. Read raw protocol frames
-3. Write outbound command frames
+2. Read MAVLink packets through libmavconn
+3. Write outbound MAVLink packets through libmavconn
 4. Surface connection health
 
 Suggested interface:
@@ -272,11 +286,14 @@ public:
 	bool connect(const std::string &uri);
 	void disconnect();
 	bool isConnected() const;
-	bool readFrame(std::vector<uint8_t> &out);
-	bool sendFrame(const std::vector<uint8_t> &payload);
+	bool readMessage(mavros_msgs::msg::Mavlink &out);
+	bool sendMessage(const mavros_msgs::msg::Mavlink &msg);
 
 private:
-	int sock_fd_{-1};
+	mavconn::MAVConnInterface::Ptr link_;
+	std::mutex rx_mutex_;
+	std::deque<mavros_msgs::msg::Mavlink> rx_queue_;
+	std::atomic<bool> connected_{false};
 };
 ```
 
@@ -284,9 +301,9 @@ private:
 
 Responsibility:
 
-1. Decode MAVLink frames to typed telemetry structs
-2. Encode command structs to MAVLink frames
-3. Hide MAVLink details from ROS2 application logic
+1. Decode `mavros_msgs::msg::Mavlink` to typed telemetry structs
+2. Encode command structs to `mavros_msgs::msg::Mavlink`
+3. Hide MAVLink details from ROS2 application logic while using mavros conversion utilities
 
 Suggested interface:
 
@@ -298,7 +315,7 @@ struct UasVelocityTelemetry;
 class MavlinkTranslator
 {
 public:
-	bool decode(const std::vector<uint8_t> &frame);
+	bool decode(const mavros_msgs::msg::Mavlink &msg);
 	bool hasState() const;
 	UasStateTelemetry takeState();
 	bool hasPosition() const;
@@ -306,12 +323,12 @@ public:
 	bool hasVelocity() const;
 	UasVelocityTelemetry takeVelocity();
 
-	std::vector<uint8_t> encodeArm(bool arm);
-	std::vector<uint8_t> encodeTakeControl();
-	std::vector<uint8_t> encodeReleaseControl();
-	std::vector<uint8_t> encodeTakeoff(float altitude_m);
-	std::vector<uint8_t> encodeLand();
-	std::vector<uint8_t> encodeCmdPosition(float n, float e, float d, float yaw);
+	mavros_msgs::msg::Mavlink encodeArm(bool arm);
+	mavros_msgs::msg::Mavlink encodeTakeControl();
+	mavros_msgs::msg::Mavlink encodeReleaseControl();
+	mavros_msgs::msg::Mavlink encodeTakeoff(float altitude_m);
+	mavros_msgs::msg::Mavlink encodeLand();
+	mavros_msgs::msg::Mavlink encodeCmdPosition(float n, float e, float d, float yaw);
 
 private:
 	bool has_state_{false};
@@ -446,61 +463,105 @@ Note: once helper classes are added, use the integrated `UasDriverNode` header/s
 // src/simulator_connection.cpp
 #include "udacidrone_driver_cpp/simulator_connection.hpp"
 
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <algorithm>
+#include <deque>
+#include <mutex>
+#include <string>
 
-#include <cstring>
+#include <mavconn/interface.hpp>
+#include <mavros_msgs/mavlink_convert.hpp>
 
 namespace udacidrone_driver_cpp
 {
 bool SimulatorConnection::connect(const std::string &uri)
 {
-	// Example URI expected: tcp:127.0.0.1:5760
-	// Parse and open socket here; return true on success.
-	(void)uri;
-	return false;
+	// Keep UdaciDrone-style URI input, adapt to libmavconn URL format.
+	disconnect();
+
+	std::string mavconn_url = uri;
+	if (uri.rfind("tcp:", 0) == 0)
+	{
+		mavconn_url = "tcp://" + uri.substr(4);
+	}
+
+	try
+	{
+		link_ = mavconn::MAVConnInterface::open_url(
+			mavconn_url,
+			1,
+			MAV_COMP_ID_ONBOARD_COMPUTER,
+			[this](const mavlink::mavlink_message_t *message, const mavconn::Framing framing)
+			{
+				mavros_msgs::msg::Mavlink ros_msg;
+				if (!mavros_msgs::mavlink::convert(*message, ros_msg, static_cast<uint8_t>(framing)))
+				{
+					return;
+				}
+				std::lock_guard<std::mutex> lock(rx_mutex_);
+				rx_queue_.push_back(std::move(ros_msg));
+			},
+			[this]()
+			{
+				connected_.store(false);
+			});
+	}
+	catch (...)
+	{
+		link_.reset();
+		connected_.store(false);
+		return false;
+	}
+
+	connected_.store(static_cast<bool>(link_) && link_->is_open());
+	return connected_.load();
 }
 
 void SimulatorConnection::disconnect()
 {
-	if (sock_fd_ >= 0)
+	if (link_)
 	{
-		::close(sock_fd_);
-		sock_fd_ = -1;
+		link_->close();
+		link_.reset();
 	}
+	connected_.store(false);
+	std::lock_guard<std::mutex> lock(rx_mutex_);
+	rx_queue_.clear();
 }
 
 bool SimulatorConnection::isConnected() const
 {
-	return sock_fd_ >= 0;
+	return connected_.load() && link_ && link_->is_open();
 }
 
-bool SimulatorConnection::readFrame(std::vector<uint8_t> &out)
+bool SimulatorConnection::readMessage(mavros_msgs::msg::Mavlink &out)
 {
-	out.clear();
 	if (!isConnected())
 	{
 		return false;
 	}
-	uint8_t buffer[2048];
-	const ssize_t n = ::recv(sock_fd_, buffer, sizeof(buffer), MSG_DONTWAIT);
-	if (n <= 0)
+	std::lock_guard<std::mutex> lock(rx_mutex_);
+	if (rx_queue_.empty())
 	{
 		return false;
 	}
-	out.insert(out.end(), buffer, buffer + n);
+	out = std::move(rx_queue_.front());
+	rx_queue_.pop_front();
 	return true;
 }
 
-bool SimulatorConnection::sendFrame(const std::vector<uint8_t> &payload)
+bool SimulatorConnection::sendMessage(const mavros_msgs::msg::Mavlink &msg)
 {
 	if (!isConnected())
 	{
 		return false;
 	}
-	const ssize_t sent = ::send(sock_fd_, payload.data(), payload.size(), 0);
-	return sent == static_cast<ssize_t>(payload.size());
+	mavlink::mavlink_message_t wire_msg;
+	if (!mavros_msgs::mavlink::convert(msg, wire_msg))
+	{
+		return false;
+	}
+	link_->send_message(&wire_msg);
+	return true;
 }
 }  // namespace udacidrone_driver_cpp
 ```
@@ -509,14 +570,172 @@ bool SimulatorConnection::sendFrame(const std::vector<uint8_t> &payload)
 // src/mavlink_translator.cpp
 #include "udacidrone_driver_cpp/mavlink_translator.hpp"
 
+#include <cmath>
+
+#include <mavros_msgs/mavlink_convert.hpp>
+
 namespace udacidrone_driver_cpp
 {
-bool MavlinkTranslator::decode(const std::vector<uint8_t> &frame)
+namespace
 {
-	// TODO: parse MAVLink bytes and populate state_/position_/velocity_.
-	// Keep this aligned with UdaciDrone MsgID routing semantics.
-	(void)frame;
-	return false;
+constexpr uint8_t kSysId = 255;
+constexpr uint8_t kCompId = MAV_COMP_ID_ONBOARD_COMPUTER;
+constexpr uint8_t kTargetSys = 1;
+constexpr uint8_t kTargetComp = 1;
+
+constexpr float kMainModeManual = 1.0F;
+constexpr float kMainModeOffboard = 6.0F;
+
+constexpr uint16_t kMaskIgnorePosition = 0x007;
+constexpr uint16_t kMaskIgnoreVelocity = 0x038;
+constexpr uint16_t kMaskIgnoreAcceleration = 0x1C0;
+constexpr uint16_t kMaskIgnoreYaw = 0x400;
+constexpr uint16_t kMaskIgnoreYawRate = 0x800;
+constexpr uint16_t kMaskIsTakeoff = 0x1000;
+constexpr uint16_t kMaskIsLand = 0x2000;
+
+mavros_msgs::msg::Mavlink toRosMavlink(const mavlink::mavlink_message_t &msg)
+{
+	mavros_msgs::msg::Mavlink out;
+	(void)mavros_msgs::mavlink::convert(msg, out);
+	return out;
+}
+
+mavros_msgs::msg::Mavlink encodeCommandLong(
+	uint16_t command,
+	float p1,
+	float p2 = 0.0F,
+	float p3 = 0.0F,
+	float p4 = 0.0F,
+	float p5 = 0.0F,
+	float p6 = 0.0F,
+	float p7 = 0.0F)
+{
+	mavlink::mavlink_message_t msg;
+	mavlink::mavlink_msg_command_long_pack(
+		kSysId,
+		kCompId,
+		&msg,
+		kTargetSys,
+		kTargetComp,
+		command,
+		0,
+		p1,
+		p2,
+		p3,
+		p4,
+		p5,
+		p6,
+		p7);
+	return toRosMavlink(msg);
+}
+
+mavros_msgs::msg::Mavlink encodeSetPositionTarget(
+	uint16_t mask,
+	float n,
+	float e,
+	float d,
+	float vn,
+	float ve,
+	float vd,
+	float yaw,
+	float yaw_rate)
+{
+	mavlink::mavlink_message_t msg;
+	mavlink::mavlink_msg_set_position_target_local_ned_pack(
+		kSysId,
+		kCompId,
+		&msg,
+		0,
+		kTargetSys,
+		kTargetComp,
+		mavlink::MAV_FRAME_LOCAL_NED,
+		mask,
+		n,
+		e,
+		d,
+		vn,
+		ve,
+		vd,
+		0.0F,
+		0.0F,
+		0.0F,
+		yaw,
+		yaw_rate);
+	return toRosMavlink(msg);
+}
+}  // namespace
+
+bool MavlinkTranslator::decode(const mavros_msgs::msg::Mavlink &msg)
+{
+	has_state_ = false;
+	has_position_ = false;
+	has_velocity_ = false;
+
+	mavlink::mavlink_message_t wire;
+	if (!mavros_msgs::mavlink::convert(msg, wire))
+	{
+		return false;
+	}
+
+	switch (wire.msgid)
+	{
+		case mavlink::MAVLINK_MSG_ID_HEARTBEAT:
+		{
+			mavlink::mavlink_heartbeat_t hb;
+			mavlink::mavlink_msg_heartbeat_decode(&wire, &hb);
+
+			state_.stamp_sec = 0.0;
+			state_.armed = (hb.base_mode & mavlink::MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+			const uint32_t main_mode = (hb.custom_mode & 0x000F0000U) >> 16U;
+			state_.guided = (main_mode == static_cast<uint32_t>(kMainModeOffboard));
+			state_.status = static_cast<int32_t>(hb.system_status);
+			has_state_ = true;
+			break;
+		}
+		case mavlink::MAVLINK_MSG_ID_LOCAL_POSITION_NED:
+		{
+			mavlink::mavlink_local_position_ned_t lp;
+			mavlink::mavlink_msg_local_position_ned_decode(&wire, &lp);
+			const double t = static_cast<double>(lp.time_boot_ms) / 1000.0;
+
+			position_.stamp_sec = t;
+			position_.north = lp.x;
+			position_.east = lp.y;
+			position_.down = lp.z;
+			has_position_ = true;
+
+			velocity_.stamp_sec = t;
+			velocity_.vn = lp.vx;
+			velocity_.ve = lp.vy;
+			velocity_.vd = lp.vz;
+			has_velocity_ = true;
+			break;
+		}
+		case mavlink::MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
+		{
+			mavlink::mavlink_global_position_int_t gp;
+			mavlink::mavlink_msg_global_position_int_decode(&wire, &gp);
+			const double t = static_cast<double>(gp.time_boot_ms) / 1000.0;
+
+			position_.stamp_sec = t;
+			position_.latitude = static_cast<double>(gp.lat) / 1e7;
+			position_.longitude = static_cast<double>(gp.lon) / 1e7;
+			position_.altitude = static_cast<double>(gp.alt) / 1000.0;
+			has_position_ = true;
+
+			velocity_.stamp_sec = t;
+			velocity_.vn = static_cast<double>(gp.vx) / 100.0;
+			velocity_.ve = static_cast<double>(gp.vy) / 100.0;
+			velocity_.vd = static_cast<double>(gp.vz) / 100.0;
+			has_velocity_ = true;
+			break;
+		}
+		default:
+			break;
+	}
+
+	return true;
 }
 
 bool MavlinkTranslator::hasState() const { return has_state_; }
@@ -528,27 +747,59 @@ UasPositionTelemetry MavlinkTranslator::takePosition() { has_position_ = false; 
 bool MavlinkTranslator::hasVelocity() const { return has_velocity_; }
 UasVelocityTelemetry MavlinkTranslator::takeVelocity() { has_velocity_ = false; return velocity_; }
 
-std::vector<uint8_t> MavlinkTranslator::encodeArm(bool arm)
+mavros_msgs::msg::Mavlink MavlinkTranslator::encodeArm(bool arm)
 {
-	// TODO: encode MAV_CMD_COMPONENT_ARM_DISARM
-	(void)arm;
-	return {};
+	return encodeCommandLong(mavlink::MAV_CMD_COMPONENT_ARM_DISARM, arm ? 1.0F : 0.0F);
 }
 
-std::vector<uint8_t> MavlinkTranslator::encodeTakeControl() { return {}; }
-std::vector<uint8_t> MavlinkTranslator::encodeReleaseControl() { return {}; }
-std::vector<uint8_t> MavlinkTranslator::encodeTakeoff(float altitude_m) { (void)altitude_m; return {}; }
-std::vector<uint8_t> MavlinkTranslator::encodeLand() { return {}; }
-std::vector<uint8_t> MavlinkTranslator::encodeCmdPosition(float n, float e, float d, float yaw)
+mavros_msgs::msg::Mavlink MavlinkTranslator::encodeTakeControl()
 {
-	(void)n;
-	(void)e;
-	(void)d;
-	(void)yaw;
-	return {};
+	return encodeCommandLong(
+		mavlink::MAV_CMD_DO_SET_MODE,
+		static_cast<float>(mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+		kMainModeOffboard,
+		0.0F);
+}
+
+mavros_msgs::msg::Mavlink MavlinkTranslator::encodeReleaseControl()
+{
+	return encodeCommandLong(
+		mavlink::MAV_CMD_DO_SET_MODE,
+		static_cast<float>(mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+		kMainModeManual,
+		0.0F);
+}
+
+mavros_msgs::msg::Mavlink MavlinkTranslator::encodeTakeoff(float altitude_m)
+{
+	const float target_d = -std::fabs(altitude_m);
+	const uint16_t mask = static_cast<uint16_t>(
+		kMaskIsTakeoff | kMaskIgnoreYawRate | kMaskIgnoreYaw | kMaskIgnoreAcceleration | kMaskIgnoreVelocity);
+	return encodeSetPositionTarget(mask, 0.0F, 0.0F, target_d, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+}
+
+mavros_msgs::msg::Mavlink MavlinkTranslator::encodeLand()
+{
+	const uint16_t mask = static_cast<uint16_t>(
+		kMaskIsLand | kMaskIgnoreYawRate | kMaskIgnoreYaw | kMaskIgnoreAcceleration | kMaskIgnoreVelocity);
+	return encodeSetPositionTarget(mask, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+}
+
+mavros_msgs::msg::Mavlink MavlinkTranslator::encodeCmdPosition(float n, float e, float d, float yaw)
+{
+	const uint16_t mask = static_cast<uint16_t>(
+		kMaskIgnoreYawRate | kMaskIgnoreAcceleration | kMaskIgnoreVelocity);
+	return encodeSetPositionTarget(mask, n, e, d, 0.0F, 0.0F, 0.0F, yaw, 0.0F);
 }
 }  // namespace udacidrone_driver_cpp
 ```
+
+This translator implementation mirrors UdaciDrone Python behavior while using mavros conversion APIs:
+
+1. Decodes `HEARTBEAT`, `LOCAL_POSITION_NED`, and `GLOBAL_POSITION_INT` into normalized state/position/velocity.
+2. Uses `MAV_CMD_COMPONENT_ARM_DISARM` and `MAV_CMD_DO_SET_MODE` for arm/offboard/manual transitions.
+3. Uses `SET_POSITION_TARGET_LOCAL_NED` masks for takeoff, land, and cmd_position semantics.
+4. Uses `mavros_msgs::mavlink::convert()` for ROS<->MAVLink conversion boundaries.
 
 ```cpp
 // src/uas_state_repository.cpp
@@ -604,32 +855,32 @@ UasCommandService::UasCommandService(
 
 bool UasCommandService::arm()
 {
-	return connection_.sendFrame(translator_.encodeArm(true));
+	return connection_.sendMessage(translator_.encodeArm(true));
 }
 
 bool UasCommandService::disarm()
 {
-	return connection_.sendFrame(translator_.encodeArm(false));
+	return connection_.sendMessage(translator_.encodeArm(false));
 }
 
 bool UasCommandService::takeControl()
 {
-	return connection_.sendFrame(translator_.encodeTakeControl());
+	return connection_.sendMessage(translator_.encodeTakeControl());
 }
 
 bool UasCommandService::releaseControl()
 {
-	return connection_.sendFrame(translator_.encodeReleaseControl());
+	return connection_.sendMessage(translator_.encodeReleaseControl());
 }
 
 bool UasCommandService::takeoff(float target_altitude_m)
 {
-	return connection_.sendFrame(translator_.encodeTakeoff(target_altitude_m));
+	return connection_.sendMessage(translator_.encodeTakeoff(target_altitude_m));
 }
 
 bool UasCommandService::land()
 {
-	return connection_.sendFrame(translator_.encodeLand());
+	return connection_.sendMessage(translator_.encodeLand());
 }
 
 bool UasCommandService::cmdPosition(float n, float e, float d, float heading_rad)
@@ -639,7 +890,7 @@ bool UasCommandService::cmdPosition(float n, float e, float d, float heading_rad
 	{
 		d = -d;
 	}
-	return connection_.sendFrame(translator_.encodeCmdPosition(n, e, d, heading_rad));
+	return connection_.sendMessage(translator_.encodeCmdPosition(n, e, d, heading_rad));
 }
 }  // namespace udacidrone_driver_cpp
 ```
@@ -1106,6 +1357,8 @@ private:
 	bool connected_{false};
 	bool use_mock_sim_{false};
 	bool start_external_control_on_boot_{false};
+	bool log_telemetry_csv_{false};
+	std::string telemetry_log_csv_path_{};
 	double session_service_timeout_sec_{1.5};
 	rclcpp::Time last_rx_time_;
 	double timeout_sec_{5.0};
@@ -1133,6 +1386,9 @@ UasDriverNode::UasDriverNode()
 	const bool is_px4 = declare_parameter<bool>("is_px4", false);
 	use_mock_sim_ = declare_parameter<bool>("use_mock_sim", false);
 	start_external_control_on_boot_ = declare_parameter<bool>("start_external_control_on_boot", false);
+	log_telemetry_csv_ = declare_parameter<bool>("log_telemetry_csv", false);
+	telemetry_log_csv_path_ = declare_parameter<std::string>(
+		"telemetry_log_csv_path", "/tmp/uas_telemetry.csv");
 	session_service_timeout_sec_ = declare_parameter<double>("session_service_timeout_sec", 1.5);
 	timeout_sec_ = declare_parameter<double>("timeout_sec", 5.0);
 	target_altitude_m_ = declare_parameter<double>("target_altitude_m", 3.0);
@@ -1182,13 +1438,13 @@ UasDriverNode::UasDriverNode()
 
 void UasDriverNode::readLoop()
 {
-	std::vector<uint8_t> frame;
-	if (!connection_.readFrame(frame))
+	mavros_msgs::msg::Mavlink mav_msg;
+	if (!connection_.readMessage(mav_msg))
 	{
 		return;
 	}
 
-	const bool decoded_ok = translator_.decode(frame);
+	const bool decoded_ok = translator_.decode(mav_msg);
 	health_monitor_.onRxFrame(decoded_ok, now());
 	if (!decoded_ok)
 	{
@@ -1257,6 +1513,14 @@ void UasDriverNode::publishTelemetry()
 	gp.longitude = snap.position.longitude;
 	gp.altitude = snap.position.altitude;
 	global_position_pub_->publish(gp);
+
+	// Optional node-local CSV log for quick parity with udacidrone drone.py logging.
+	// For full-fidelity ROS telemetry capture, prefer rosbag2 recording from launch.
+	if (log_telemetry_csv_)
+	{
+		// Append one row: stamp,n,e,d,vn,ve,vd,lat,lon,alt,armed,connected
+		// (Implementation detail intentionally omitted in this template.)
+	}
 }
 
 void UasDriverNode::publishHealth()
@@ -1375,6 +1639,8 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(mavros_msgs REQUIRED)
+find_package(libmavconn REQUIRED)
 
 add_executable(uas_driver_node
 	src/main.cpp
@@ -1394,10 +1660,16 @@ ament_target_dependencies(uas_driver_node
 	std_msgs
 	std_srvs
 	geometry_msgs
-	sensor_msgs)
+	sensor_msgs
+	mavros_msgs
+	libmavconn)
+
+target_link_libraries(uas_driver_node mavconn)
 
 install(TARGETS uas_driver_node DESTINATION lib/${PROJECT_NAME})
 ```
+
+If you keep the translator implementation above, install `ros-jazzy-mavros-msgs` and `ros-jazzy-libmavconn` in your dev image.
 
 ### 4.1.9 Launch Arguments and Bringup Modes (UR-Style)
 
@@ -1414,6 +1686,12 @@ Why this is still relevant for a drone stack:
 3. `launch_session_manager` default `true`
 4. `start_external_control_on_boot` default `false`
 5. `session_service_timeout_sec` default `1.5`
+6. `record_telemetry` default `true`
+7. `telemetry_record_mode` default `rosbag2`
+8. `telemetry_output_dir` default `/tmp/uas_logs`
+9. `telemetry_run_id` default `manual_flight`
+10. `log_telemetry_csv` default `false`
+11. `telemetry_log_csv_path` default `/tmp/uas_telemetry.csv`
 
 Meaning and drone-specific relevance:
 
@@ -1427,12 +1705,21 @@ If `false`, bypass external-control gating and run driver in simplified mode. Th
 If `true`, request external-control session automatically at startup. This mirrors UR auto-start behavior and reduces manual steps.
 5. `session_service_timeout_sec`:
 How long to wait for session services before marking bringup degraded. This replaces manipulator-oriented controller spawner timeout with a drone-relevant readiness timeout.
+6. `record_telemetry`:
+If `true`, launch recording in the backend while you manually fly in Unity. This is the closest ROS2 equivalent to running `udacidrone` `drone.py` as a telemetry logger.
+7. `telemetry_record_mode`:
+Select recording backend. `rosbag2` is recommended because it preserves all typed ROS2 topics.
+8. `telemetry_output_dir` and `telemetry_run_id`:
+Control where logs are stored, e.g. `/tmp/uas_logs/manual_flight`.
+9. `log_telemetry_csv` and `telemetry_log_csv_path`:
+Optional node-level CSV output if you want a lightweight flat file similar to UdaciDrone text logs.
 
 Node inclusion conditions:
 
 1. If `use_mock_sim == true`, disable session-manager and command gating by external run-state.
 2. If `launch_session_manager == true`, keep session-manager logic enabled (currently in-process in `UasDriverNode`; separate helper node is optional future work).
 3. If `headless_mode == true`, auto-start external control when dependencies are ready.
+4. If `record_telemetry == true`, record `/uas/*` topics while the Unity operator manually flies.
 
 ### 4.1.10 ROS2 Python Launch Scripts for udacidrone_driver_cpp
 
@@ -1442,6 +1729,7 @@ Add launch files directly in the driver package so Unity bringup is easy to test
 # launch/udacidrone_driver.launch.py
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.actions import ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
@@ -1457,6 +1745,12 @@ def generate_launch_description():
 	timeout_sec = LaunchConfiguration("timeout_sec")
 	target_altitude_m = LaunchConfiguration("target_altitude_m")
 	session_service_timeout_sec = LaunchConfiguration("session_service_timeout_sec")
+	record_telemetry = LaunchConfiguration("record_telemetry")
+	telemetry_record_mode = LaunchConfiguration("telemetry_record_mode")
+	telemetry_output_dir = LaunchConfiguration("telemetry_output_dir")
+	telemetry_run_id = LaunchConfiguration("telemetry_run_id")
+	log_telemetry_csv = LaunchConfiguration("log_telemetry_csv")
+	telemetry_log_csv_path = LaunchConfiguration("telemetry_log_csv_path")
 
 	# If launch_session_manager is disabled, force mock mode to bypass session gating.
 	effective_use_mock_sim = PythonExpression(
@@ -1477,8 +1771,28 @@ def generate_launch_description():
 				"timeout_sec": timeout_sec,
 				"target_altitude_m": target_altitude_m,
 				"session_service_timeout_sec": session_service_timeout_sec,
+				"log_telemetry_csv": log_telemetry_csv,
+				"telemetry_log_csv_path": telemetry_log_csv_path,
 			}
 		],
+	)
+
+	# ROS2 equivalent to running udacidrone drone.py for manual-flight telemetry capture.
+	# Records key UAS topics while Unity is manually flown.
+	rosbag_recorder = ExecuteProcess(
+		condition=IfCondition(
+			PythonExpression([record_telemetry, " and '", telemetry_record_mode, "' == 'rosbag2'"])
+		),
+		cmd=[
+			"ros2", "bag", "record",
+			"-o", PythonExpression([telemetry_output_dir, " + '/' + ", telemetry_run_id]),
+			"/uas/armed",
+			"/uas/local_position",
+			"/uas/local_velocity",
+			"/uas/global_position",
+			"/uas/driver_health",
+		],
+		output="screen",
 	)
 
 	# Optional placeholder for a future dedicated session helper process.
@@ -1502,7 +1816,14 @@ def generate_launch_description():
 			DeclareLaunchArgument("timeout_sec", default_value="5.0"),
 			DeclareLaunchArgument("target_altitude_m", default_value="3.0"),
 			DeclareLaunchArgument("session_service_timeout_sec", default_value="1.5"),
+			DeclareLaunchArgument("record_telemetry", default_value="true"),
+			DeclareLaunchArgument("telemetry_record_mode", default_value="rosbag2"),
+			DeclareLaunchArgument("telemetry_output_dir", default_value="/tmp/uas_logs"),
+			DeclareLaunchArgument("telemetry_run_id", default_value="manual_flight"),
+			DeclareLaunchArgument("log_telemetry_csv", default_value="false"),
+			DeclareLaunchArgument("telemetry_log_csv_path", default_value="/tmp/uas_telemetry.csv"),
 			driver_node,
+			rosbag_recorder,
 			session_helper_placeholder,
 		]
 	)
@@ -1553,6 +1874,35 @@ Use this order while implementing so each step compiles before the next one.
 7. Register all sources in CMake from Section 4.1.8.
 8. Add and validate launch scripts from Section 4.1.10.
 9. Validate launch runtime modes from Section 4.1.9.
+10. Validate telemetry recording behavior (rosbag2 and optional CSV).
+
+### 4.1.12 Manual-Flight Backend Test Mode (UdaciDrone drone.py Equivalent)
+
+Yes. You can test your ROS2 C++ driver the same way UdaciDrone uses `drone.py` during manual Unity flight:
+
+1. Launch Unity simulator and fly manually with keyboard/joystick.
+2. Launch ROS2 backend only (no mission state machine required).
+3. Keep command services idle; use the driver as a telemetry receiver/logger.
+
+Recommended command:
+
+```bash
+ros2 launch udacidrone_driver_cpp udacidrone_driver.launch.py \
+	connection_uri:=tcp:127.0.0.1:5760 \
+	use_mock_sim:=false \
+	record_telemetry:=true \
+	telemetry_record_mode:=rosbag2 \
+	telemetry_output_dir:=/tmp/uas_logs \
+	telemetry_run_id:=manual_flight
+```
+
+Where telemetry is recorded:
+
+1. Default: rosbag2 output under `${telemetry_output_dir}/${telemetry_run_id}`.
+2. Optional CSV: if `log_telemetry_csv:=true`, node writes rows to `telemetry_log_csv_path`.
+3. Live verification: `ros2 topic echo /uas/global_position` and `ros2 topic echo /uas/local_position`.
+
+This gives you the same practical validation loop as UdaciDrone manual-flight logging, but with ROS2-native typed logs that can be replayed using `ros2 bag play`.
 
 ## 4.2 uas_mission_core Class Model
 
@@ -1633,8 +1983,8 @@ States:
 
 ## Step 3: Add Telemetry Decode Path
 
-1. Implement `SimulatorConnection::connect`, `readFrame`, and `disconnect`.
-2. Implement `MavlinkTranslator::decode` to map incoming frames to typed telemetry.
+1. Implement `SimulatorConnection::connect`, `readMessage`, and `disconnect`.
+2. Implement `MavlinkTranslator::decode` to map incoming MAVROS messages to typed telemetry.
 3. Update state snapshots in `UasStateRepository`.
 4. Publish `/uas/armed`, `/uas/local_position`, `/uas/local_velocity`, `/uas/global_position`.
 5. Add watchdog timeout parity with UdaciDrone dispatch timeout behavior.
@@ -1692,6 +2042,7 @@ ros2 topic pub /uas/cmd_position geometry_msgs/msg/PoseStamped "{pose: {position
 2. Run star mission and verify waypoint order.
 3. Run patrol mission with loop/time limits.
 4. Test connection drop and verify abort to safe landing.
+5. Run manual-flight logging mode and confirm rosbag2 capture of `/uas/global_position`.
 
 ## 6. Suggested Package File Layout (C++ + ROS2 Launch)
 
@@ -1722,6 +2073,9 @@ udacidrone_driver_cpp/
 		udacidrone_driver_mock.launch.py
 	config/
 		driver_params.yaml
+	logs/
+		rosbag2/
+		telemetry_csv/
 ```
 
 ```text
@@ -1769,9 +2123,20 @@ Inside container:
 ```bash
 source /opt/ros/jazzy/setup.bash
 cd /opt/ws
+
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
+```
+
+NOTE: After running "rosdep install ....", I got the following output:
+
+```bash
+rosdep install --from-paths src --ignore-src -r -y
+/usr/bin/rosdep:6: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
+  from pkg_resources import load_entry_point
+#All required rosdeps installed successfully
 ```
 
 Run only the driver first:
@@ -1788,7 +2153,11 @@ ros2 launch udacidrone_driver_cpp udacidrone_driver.launch.py \
 	is_px4:=false \
 	use_mock_sim:=false \
 	launch_session_manager:=true \
-	start_external_control_on_boot:=false
+	start_external_control_on_boot:=false \
+	record_telemetry:=true \
+	telemetry_record_mode:=rosbag2 \
+	telemetry_output_dir:=/tmp/uas_logs \
+	telemetry_run_id:=manual_flight
 ```
 
 Run mock mode for fast checks (no Unity dependency):
@@ -1804,6 +2173,13 @@ ros2 node list | grep uas_driver_node
 ros2 topic list | grep /uas/
 ros2 topic echo /uas/driver_health
 ros2 service call /uas/arm std_srvs/srv/SetBool "{data: true}"
+```
+
+Inspect recorded telemetry:
+
+```bash
+ls -lah /tmp/uas_logs/manual_flight
+ros2 bag info /tmp/uas_logs/manual_flight
 ```
 
 Run stack:
