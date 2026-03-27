@@ -127,6 +127,9 @@ services:
 
 ```bash
 #!/usr/bin/env bash
+
+cd ~/src/FCND-Backyard-UAS-Flyer/src/infrastructure
+
 set -e
 docker compose build
 ```
@@ -165,6 +168,7 @@ ls /opt/ros/jazzy/include/mavros_msgs/mavlink_convert.hpp
 ```
 
 Note: Some Jazzy images do not expose `mavlink/v2.0/common/mavlink.h` on the default include path. The driver implementation should rely on `mavros_msgs/mavlink_convert.hpp` and `libmavconn` headers instead of directly including `mavlink.h`.
+Important: avoid including `mavros/mavros_uas.hpp` in low-level driver translation units unless you explicitly need MAVROS UAS helpers. That header transitively depends on `tf2_ros/buffer.hpp`. If you do include it, ensure `tf2_ros` is installed and added to package dependencies.
 
 ## 2. Architecture Translation from Problem Statement
 
@@ -188,7 +192,7 @@ cd /opt/ws/src/uas_stack
 
 ros2 pkg create --build-type ament_cmake udacidrone_msgs
 ros2 pkg create --build-type ament_cmake udacidrone_driver_cpp --dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs nav_msgs
-ros2 pkg create --build-type ament_cmake uas_mission_core --dependencies rclcpp geometry_msgs
+ros2 pkg create --build-type ament_cmake uas_mission_core --dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs nav_msgs tf2_ros moveit_core moveit_ros_planning moveit_ros_planning_interface
 ros2 pkg create --build-type ament_cmake sm_uas_missions --dependencies rclcpp smacc2 smacc2_msgs geometry_msgs std_msgs
 ros2 pkg create --build-type ament_cmake uas_bringup --dependencies rclcpp launch launch_ros
 ```
@@ -473,6 +477,11 @@ Note: once helper classes are added, use the integrated `UasDriverNode` header/s
 
 namespace udacidrone_driver_cpp
 {
+namespace
+{
+constexpr uint8_t kCompIdOnboardComputer = 191;  // MAV_COMP_ID_ONBOARD_COMPUTER
+}
+
 bool SimulatorConnection::connect(const std::string &uri)
 {
 	// Keep UdaciDrone-style URI input, adapt to libmavconn URL format.
@@ -489,7 +498,7 @@ bool SimulatorConnection::connect(const std::string &uri)
 		link_ = mavconn::MAVConnInterface::open_url(
 			mavconn_url,
 			1,
-			MAV_COMP_ID_ONBOARD_COMPUTER,
+			kCompIdOnboardComputer,
 			[this](const mavlink::mavlink_message_t *message, const mavconn::Framing framing)
 			{
 				mavros_msgs::msg::Mavlink ros_msg;
@@ -572,6 +581,55 @@ bool SimulatorConnection::sendMessage(const mavros_msgs::msg::Mavlink &msg)
 
 #include <cmath>
 
+#if __has_include(<mavlink/v2.0/mavlink.h>)
+extern "C" {
+#ifndef MAVLINK_DIALECT
+#define MAVLINK_DIALECT common
+#endif
+#include <mavlink/v2.0/mavlink.h>
+}
+namespace mavlink {
+using mavlink_message_t = ::mavlink_message_t;
+}
+#elif __has_include(<mavlink/v2.0/common/mavlink.h>)
+extern "C" {
+#include <mavlink/v2.0/common/mavlink.h>
+}
+namespace mavlink {
+using mavlink_message_t = ::mavlink_message_t;
+}
+#elif __has_include(<mavconn/mavlink_dialect.hpp>)
+#include <mavconn/mavlink_dialect.hpp>
+#elif __has_include(<mavlink/v2.0/minimal/mavlink.h>)
+extern "C" {
+#include <mavlink/v2.0/minimal/mavlink.h>
+}
+namespace mavlink {
+using mavlink_message_t = ::mavlink_message_t;
+}
+#elif __has_include(<mavlink/common/mavlink.h>)
+extern "C" {
+#include <mavlink/common/mavlink.h>
+}
+namespace mavlink {
+using mavlink_message_t = ::mavlink_message_t;
+}
+#elif __has_include(<common/mavlink.h>)
+extern "C" {
+#include <common/mavlink.h>
+}
+namespace mavlink {
+using mavlink_message_t = ::mavlink_message_t;
+}
+#else
+#error "No MAVLink dialect header found. Install ros-jazzy-mavlink and ros-jazzy-libmavconn."
+#endif
+
+// Prevent macro collision with MAVLink C++ headers/types in downstream includes.
+#ifdef MAVLINK_VERSION
+#undef MAVLINK_VERSION
+#endif
+
 #include <mavros_msgs/mavlink_convert.hpp>
 
 namespace udacidrone_driver_cpp
@@ -579,7 +637,7 @@ namespace udacidrone_driver_cpp
 namespace
 {
 constexpr uint8_t kSysId = 255;
-constexpr uint8_t kCompId = MAV_COMP_ID_ONBOARD_COMPUTER;
+constexpr uint8_t kCompId = 191;  // MAV_COMP_ID_ONBOARD_COMPUTER
 constexpr uint8_t kTargetSys = 1;
 constexpr uint8_t kTargetComp = 1;
 
@@ -612,7 +670,7 @@ mavros_msgs::msg::Mavlink encodeCommandLong(
 	float p7 = 0.0F)
 {
 	mavlink::mavlink_message_t msg;
-	mavlink::mavlink_msg_command_long_pack(
+	::mavlink_msg_command_long_pack(
 		kSysId,
 		kCompId,
 		&msg,
@@ -642,14 +700,14 @@ mavros_msgs::msg::Mavlink encodeSetPositionTarget(
 	float yaw_rate)
 {
 	mavlink::mavlink_message_t msg;
-	mavlink::mavlink_msg_set_position_target_local_ned_pack(
+	::mavlink_msg_set_position_target_local_ned_pack(
 		kSysId,
 		kCompId,
 		&msg,
 		0,
 		kTargetSys,
 		kTargetComp,
-		mavlink::MAV_FRAME_LOCAL_NED,
+		MAV_FRAME_LOCAL_NED,
 		mask,
 		n,
 		e,
@@ -680,23 +738,23 @@ bool MavlinkTranslator::decode(const mavros_msgs::msg::Mavlink &msg)
 
 	switch (wire.msgid)
 	{
-		case mavlink::MAVLINK_MSG_ID_HEARTBEAT:
+		case MAVLINK_MSG_ID_HEARTBEAT:
 		{
-			mavlink::mavlink_heartbeat_t hb;
-			mavlink::mavlink_msg_heartbeat_decode(&wire, &hb);
+			mavlink_heartbeat_t hb;
+			::mavlink_msg_heartbeat_decode(&wire, &hb);
 
 			state_.stamp_sec = 0.0;
-			state_.armed = (hb.base_mode & mavlink::MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+			state_.armed = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
 			const uint32_t main_mode = (hb.custom_mode & 0x000F0000U) >> 16U;
 			state_.guided = (main_mode == static_cast<uint32_t>(kMainModeOffboard));
 			state_.status = static_cast<int32_t>(hb.system_status);
 			has_state_ = true;
 			break;
 		}
-		case mavlink::MAVLINK_MSG_ID_LOCAL_POSITION_NED:
+		case MAVLINK_MSG_ID_LOCAL_POSITION_NED:
 		{
-			mavlink::mavlink_local_position_ned_t lp;
-			mavlink::mavlink_msg_local_position_ned_decode(&wire, &lp);
+			mavlink_local_position_ned_t lp;
+			::mavlink_msg_local_position_ned_decode(&wire, &lp);
 			const double t = static_cast<double>(lp.time_boot_ms) / 1000.0;
 
 			position_.stamp_sec = t;
@@ -712,10 +770,10 @@ bool MavlinkTranslator::decode(const mavros_msgs::msg::Mavlink &msg)
 			has_velocity_ = true;
 			break;
 		}
-		case mavlink::MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
+		case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
 		{
-			mavlink::mavlink_global_position_int_t gp;
-			mavlink::mavlink_msg_global_position_int_decode(&wire, &gp);
+			mavlink_global_position_int_t gp;
+			::mavlink_msg_global_position_int_decode(&wire, &gp);
 			const double t = static_cast<double>(gp.time_boot_ms) / 1000.0;
 
 			position_.stamp_sec = t;
@@ -749,14 +807,14 @@ UasVelocityTelemetry MavlinkTranslator::takeVelocity() { has_velocity_ = false; 
 
 mavros_msgs::msg::Mavlink MavlinkTranslator::encodeArm(bool arm)
 {
-	return encodeCommandLong(mavlink::MAV_CMD_COMPONENT_ARM_DISARM, arm ? 1.0F : 0.0F);
+	return encodeCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, arm ? 1.0F : 0.0F);
 }
 
 mavros_msgs::msg::Mavlink MavlinkTranslator::encodeTakeControl()
 {
 	return encodeCommandLong(
-		mavlink::MAV_CMD_DO_SET_MODE,
-		static_cast<float>(mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+		MAV_CMD_DO_SET_MODE,
+		static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
 		kMainModeOffboard,
 		0.0F);
 }
@@ -764,8 +822,8 @@ mavros_msgs::msg::Mavlink MavlinkTranslator::encodeTakeControl()
 mavros_msgs::msg::Mavlink MavlinkTranslator::encodeReleaseControl()
 {
 	return encodeCommandLong(
-		mavlink::MAV_CMD_DO_SET_MODE,
-		static_cast<float>(mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+		MAV_CMD_DO_SET_MODE,
+		static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
 		kMainModeManual,
 		0.0F);
 }
@@ -795,6 +853,12 @@ mavros_msgs::msg::Mavlink MavlinkTranslator::encodeCmdPosition(float n, float e,
 ```
 
 This translator implementation mirrors UdaciDrone Python behavior while using mavros conversion APIs:
+
+MAVLink symbol note:
+
+1. Functions such as `mavlink_msg_command_long_pack` and `mavlink_msg_set_position_target_local_ned_pack` come from the MAVLink C headers and are exposed as global C symbols/macros.
+2. Do not prefix those APIs with `mavlink::`.
+3. In ROS2 Jazzy, these symbols are provided through the installed MAVLink/libmavconn stack (which is generated from MAVLink C header sets like your `c_library_v1`), so your project can use them without vendoring `c_library_v1` directly.
 
 1. Decodes `HEARTBEAT`, `LOCAL_POSITION_NED`, and `GLOBAL_POSITION_INT` into normalized state/position/velocity.
 2. Uses `MAV_CMD_COMPONENT_ARM_DISARM` and `MAV_CMD_DO_SET_MODE` for arm/offboard/manual transitions.
@@ -1639,6 +1703,7 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(mavlink REQUIRED)
 find_package(mavros_msgs REQUIRED)
 find_package(libmavconn REQUIRED)
 
@@ -1661,15 +1726,16 @@ ament_target_dependencies(uas_driver_node
 	std_srvs
 	geometry_msgs
 	sensor_msgs
+	mavlink
 	mavros_msgs
 	libmavconn)
-
-target_link_libraries(uas_driver_node mavconn)
 
 install(TARGETS uas_driver_node DESTINATION lib/${PROJECT_NAME})
 ```
 
-If you keep the translator implementation above, install `ros-jazzy-mavros-msgs` and `ros-jazzy-libmavconn` in your dev image.
+Linking note: do not add `target_link_libraries(uas_driver_node mavconn)` on Jazzy unless you have verified that raw library name exists on the linker path. `ament_target_dependencies(... libmavconn)` is the portable way because it uses the package-exported link interface.
+
+If you keep the translator implementation above, install `ros-jazzy-mavlink`, `ros-jazzy-mavros-msgs`, and `ros-jazzy-libmavconn` in your dev image.
 
 ### 4.1.9 Launch Arguments and Bringup Modes (UR-Style)
 
@@ -1906,7 +1972,194 @@ This gives you the same practical validation loop as UdaciDrone manual-flight lo
 
 ## 4.2 uas_mission_core Class Model
 
-### Interface: IMissionPlanner
+This package should represent the C++ ROS2 MoveIt2 autonomy backend, not only mission-shape planners.
+
+Use a layered autonomy model:
+
+1. Sensor Layer (ingestion + time alignment)
+2. Perception Layer (detection + localization + world-state updates)
+3. Planning Layer (route + prediction + behavior + trajectory)
+4. Control Layer (trajectory tracking + command publishing + safety fallback)
+5. Mission Planner Layer (rectangle/star/patrol task generation)
+
+This aligns with MoveIt2 tutorial patterns that emphasize:
+
+1. `planning_scene_monitor::PlanningSceneMonitor` as the canonical world-state hub.
+2. `planning_scene_monitor::CurrentStateMonitor` for robot state ingestion.
+3. `planning_pipeline::PlanningPipeline` and `planning_interface::MotionPlanRequest` for motion planning.
+4. `moveit_cpp::MoveItCpp` for C++-native orchestration entry points.
+
+### 4.2.1 Sensor Layer
+
+Goal: ingest telemetry from `udacidrone_driver_cpp` and normalize into autonomy-ready state.
+
+Primary subscriptions:
+
+1. `/uas/armed`
+2. `/uas/local_position`
+3. `/uas/local_velocity`
+4. `/uas/global_position`
+5. `/uas/driver_health`
+
+Core interfaces:
+
+```cpp
+class ISensorIngestor
+{
+public:
+	virtual ~ISensorIngestor() = default;
+	virtual void onArmed(const std_msgs::msg::Bool &msg) = 0;
+	virtual void onLocalPosition(const geometry_msgs::msg::PointStamped &msg) = 0;
+	virtual void onLocalVelocity(const geometry_msgs::msg::Vector3Stamped &msg) = 0;
+	virtual void onGlobalPosition(const sensor_msgs::msg::NavSatFix &msg) = 0;
+	virtual void onDriverHealth(const std_msgs::msg::String &msg) = 0;
+	virtual UasAutonomyObservation snapshot() const = 0;
+};
+
+class UasSensorFusionCache : public ISensorIngestor
+{
+public:
+	void onArmed(const std_msgs::msg::Bool &msg) override;
+	void onLocalPosition(const geometry_msgs::msg::PointStamped &msg) override;
+	void onLocalVelocity(const geometry_msgs::msg::Vector3Stamped &msg) override;
+	void onGlobalPosition(const sensor_msgs::msg::NavSatFix &msg) override;
+	void onDriverHealth(const std_msgs::msg::String &msg) override;
+	UasAutonomyObservation snapshot() const override;
+
+private:
+	mutable std::mutex mutex_;
+	UasAutonomyObservation latest_{};
+};
+```
+
+### 4.2.2 Perception Layer
+
+Goal: convert fused telemetry and external observations into world entities and confidence-scored tracks.
+
+Responsibilities:
+
+1. Detection and tracking of obstacles, no-fly geofences, and dynamic entities.
+2. Localization state estimation (NED-consistent for UAS stack).
+3. Planning-scene synchronization for MoveIt2 consumers.
+
+Core interfaces:
+
+```cpp
+class IPerceptionModule
+{
+public:
+	virtual ~IPerceptionModule() = default;
+	virtual PerceptionFrame update(const UasAutonomyObservation &obs) = 0;
+};
+
+class PerceptionSceneBridge
+{
+public:
+	PerceptionSceneBridge(const rclcpp::Node::SharedPtr &node,
+	                     const planning_scene_monitor::PlanningSceneMonitorPtr &psm);
+
+	void apply(const PerceptionFrame &frame);
+	WorldStateSnapshot snapshot() const;
+
+private:
+	planning_scene_monitor::PlanningSceneMonitorPtr psm_;
+};
+```
+
+### 4.2.3 Planning Layer
+
+Organize planning into four explicit components:
+
+1. Route Planning: global mission route over waypoints/geofences.
+2. Prediction: short-horizon conflict and trajectory prediction for dynamic entities.
+3. Behavior Planning: choose maneuver mode (proceed, hold, reroute, abort).
+4. Trajectory Planning: produce feasible trajectory using MoveIt2 planning pipeline.
+
+Core interfaces:
+
+```cpp
+class IRoutePlanner
+{
+public:
+	virtual ~IRoutePlanner() = default;
+	virtual RoutePlan computeRoute(const MissionRequest &req,
+	                               const WorldStateSnapshot &world) = 0;
+};
+
+class IPredictionModule
+{
+public:
+	virtual ~IPredictionModule() = default;
+	virtual PredictionBundle predict(const WorldStateSnapshot &world,
+	                                 rclcpp::Time stamp) = 0;
+};
+
+class IBehaviorPlanner
+{
+public:
+	virtual ~IBehaviorPlanner() = default;
+	virtual BehaviorDecision decide(const RoutePlan &route,
+	                               const PredictionBundle &pred,
+	                               const UasAutonomyObservation &obs) = 0;
+};
+
+class ITrajectoryPlanner
+{
+public:
+	virtual ~ITrajectoryPlanner() = default;
+	virtual TrajectoryPlan plan(const BehaviorDecision &decision,
+	                           const UasAutonomyObservation &obs) = 0;
+};
+
+class MoveItTrajectoryPlanner : public ITrajectoryPlanner
+{
+public:
+	MoveItTrajectoryPlanner(const rclcpp::Node::SharedPtr &node,
+	                      const planning_scene_monitor::PlanningSceneMonitorPtr &psm);
+
+	TrajectoryPlan plan(const BehaviorDecision &decision,
+	                   const UasAutonomyObservation &obs) override;
+
+private:
+	planning_scene_monitor::PlanningSceneMonitorPtr psm_;
+	planning_pipeline::PlanningPipelinePtr planning_pipeline_;
+};
+```
+
+### 4.2.4 Control Layer
+
+Goal: convert planned trajectory to safe UAS commands and publish through driver command interfaces.
+
+Responsibilities:
+
+1. Trajectory tracking and command-rate control.
+2. Safety gating and fallback (hold, land, abort).
+3. Publishing command goals to `/uas/cmd_position` and command services.
+
+Core interfaces:
+
+```cpp
+class IController
+{
+public:
+	virtual ~IController() = default;
+	virtual ControlCommand compute(const TrajectoryPlan &traj,
+	                              const UasAutonomyObservation &obs,
+	                              rclcpp::Duration dt) = 0;
+};
+
+class UasControlExecutor
+{
+public:
+	explicit UasControlExecutor(rclcpp::Node &node);
+	bool send(const ControlCommand &cmd);
+	bool emergencyLand();
+};
+```
+
+### 4.2.5 Mission Planner Layer
+
+Keep mission-shape planning but position it as an upstream producer to the autonomy stack.
 
 ```cpp
 class IMissionPlanner
@@ -1917,17 +2170,62 @@ public:
 };
 ```
 
-### Implementations
+Implementations:
 
 1. RectangleMissionPlanner
 2. StarMissionPlanner
 3. PatrolMissionPlanner
 
-### Supporting Classes
+Supporting classes:
 
 1. GeofenceValidator
 2. WaypointAcceptancePolicy
 3. MissionPlanSerializer
+
+### 4.2.6 MoveIt2 Autonomy Node Composition
+
+Suggested node composition for `uas_mission_core`:
+
+```cpp
+class UasAutonomyNode : public rclcpp::Node
+{
+public:
+	explicit UasAutonomyNode(const rclcpp::NodeOptions &opts = rclcpp::NodeOptions());
+
+private:
+	void autonomyTick();
+
+	std::shared_ptr<UasSensorFusionCache> sensor_cache_;
+	std::shared_ptr<IPerceptionModule> perception_;
+	std::shared_ptr<PerceptionSceneBridge> scene_bridge_;
+	std::shared_ptr<IRoutePlanner> route_planner_;
+	std::shared_ptr<IPredictionModule> prediction_;
+	std::shared_ptr<IBehaviorPlanner> behavior_planner_;
+	std::shared_ptr<ITrajectoryPlanner> trajectory_planner_;
+	std::shared_ptr<IController> controller_;
+	std::shared_ptr<UasControlExecutor> control_executor_;
+	rclcpp::TimerBase::SharedPtr autonomy_timer_;
+};
+```
+
+Recommended default execution order per tick:
+
+1. Sensor snapshot
+2. Perception update
+3. Route planning
+4. Prediction
+5. Behavior decision
+6. Trajectory planning
+7. Control command output
+
+### 4.2.7 MoveIt2 Tutorial Design Anchors
+
+While implementing this stack, mirror these patterns from your local `moveit2_tutorials` fork:
+
+1. Planning scene ownership and synchronization from the planning scene monitor tutorials.
+2. Motion plan request and planning pipeline execution from the motion planning pipeline examples.
+3. C++ composition using MoveItCpp where full MoveGroup server assumptions are not required.
+4. Optional hybrid-planning style split between global and local behavior when prediction complexity grows.
 
 ## 4.3 sm_uas_missions Class Model
 
@@ -2012,17 +2310,19 @@ ros2 service call /uas/takeoff std_srvs/srv/Trigger "{}"
 ros2 topic pub /uas/cmd_position geometry_msgs/msg/PoseStamped "{pose: {position: {x: 5.0, y: 0.0, z: 3.0}}}" -1
 ```
 
-## Step 5: Implement Mission Planners
+## Step 5: Implement uas_mission_core Autonomy Layers
 
-1. Implement rectangle planner and test deterministic output.
-2. Implement star planner with radius and point-count parameters.
-3. Implement patrol planner reading YAML waypoints.
-4. Apply geofence and altitude validation in a shared validator.
+1. Implement Sensor Layer subscriptions and timestamp alignment from `/uas/*` telemetry topics.
+2. Implement Perception Layer for detection/localization and planning-scene updates.
+3. Implement Planning Layer in four modules: route, prediction, behavior, trajectory.
+4. Implement Control Layer that publishes `/uas/cmd_position` and calls safety services.
+5. Keep mission-shape planners (rectangle/star/patrol) as request producers into route planning.
 
 ## Step 6: Integrate SMACC2 Mission Orchestration
 
 1. Create state classes and transitions for FCND-equivalent flow.
-2. Bind client behaviors to driver services/topics.
+2. Bind SMACC2 client behaviors to autonomy node APIs (not directly to transport details).
+3. Route mission requests into `uas_mission_core` autonomy pipeline and consume autonomy status events.
 3. Add guards:
 	 - takeoff reached by altitude tolerance
 	 - waypoint reached by position and velocity tolerance
@@ -2081,6 +2381,18 @@ udacidrone_driver_cpp/
 ```text
 uas_mission_core/
 	include/uas_mission_core/
+		uas_autonomy_node.hpp
+		sensor/i_sensor_ingestor.hpp
+		sensor/uas_sensor_fusion_cache.hpp
+		perception/i_perception_module.hpp
+		perception/perception_scene_bridge.hpp
+		planning/i_route_planner.hpp
+		planning/i_prediction_module.hpp
+		planning/i_behavior_planner.hpp
+		planning/i_trajectory_planner.hpp
+		planning/moveit_trajectory_planner.hpp
+		control/i_controller.hpp
+		control/uas_control_executor.hpp
 		i_mission_planner.hpp
 		rectangle_mission_planner.hpp
 		star_mission_planner.hpp
@@ -2088,6 +2400,15 @@ uas_mission_core/
 		geofence_validator.hpp
 		waypoint_acceptance_policy.hpp
 	src/
+		uas_autonomy_node.cpp
+		sensor/uas_sensor_fusion_cache.cpp
+		perception/perception_scene_bridge.cpp
+		planning/route_planner.cpp
+		planning/prediction_module.cpp
+		planning/behavior_planner.cpp
+		planning/moveit_trajectory_planner.cpp
+		control/controller.cpp
+		control/uas_control_executor.cpp
 		rectangle_mission_planner.cpp
 		star_mission_planner.cpp
 		patrol_mission_planner.cpp
@@ -2103,6 +2424,12 @@ Prioritize this sequence:
 	 - /uas/armed
 	 - /uas/local_position
 	 - /uas/local_velocity
+	 - /uas/global_position
+	 - /uas/driver_health
+	 - /autonomy/perception/world_state
+	 - /autonomy/planning/behavior_decision
+	 - /autonomy/planning/trajectory
+	 - /autonomy/control/command_status
 
 2. Services
 	 - /uas/arm
@@ -2110,9 +2437,16 @@ Prioritize this sequence:
 	 - /uas/take_control
 	 - /uas/takeoff
 	 - /uas/land
+	 - /autonomy/replan
+	 - /autonomy/hold
+	 - /autonomy/abort
 
 3. Command topic
 	 - /uas/cmd_position
+
+4. Optional actions (recommended for autonomy integration)
+	 - /autonomy/execute_route
+	 - /autonomy/execute_mission
 
 After this baseline works, add action-based waypoint mission execution.
 
@@ -2124,11 +2458,21 @@ Inside container:
 source /opt/ros/jazzy/setup.bash
 cd /opt/ws
 
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/
+rosdep install --from-paths uas_stack --ignore-src -r -y
+
 cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
-rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 ```
+
+If build fails with `fatal error: tf2_ros/buffer.hpp: No such file or directory`, use this checklist:
+
+1. Remove unnecessary includes of `mavros/mavros_uas.hpp` from driver source files.
+2. Rebuild after `docker compose build --no-cache` so container packages match Dockerfile.
+3. If `mavros_uas.hpp` is required, install and declare `tf2_ros` explicitly:
+	 - apt package: `ros-jazzy-tf2-ros`
+	 - CMake: `find_package(tf2_ros REQUIRED)` and add to `ament_target_dependencies(...)`.
 
 NOTE: After running "rosdep install ....", I got the following output:
 
@@ -2193,7 +2537,7 @@ ros2 launch uas_bringup uas_stack.launch.py mission_mode:=rectangle
 1. FCND baseline mission reproduced: takeoff 3 m, rectangle path, land, disarm.
 2. Star mission implemented and validated.
 3. Patrol mission implemented with duration/geofence safeguards.
-4. Clear separation between protocol adapter and mission logic.
+4. Clear separation between transport adapter, sensor/perception/planning/control layers, and mission orchestration.
 5. Dockerized dev workflow is reproducible on fresh machine.
 6. Connection loss triggers deterministic abort/landing behavior.
 
@@ -2201,9 +2545,9 @@ ros2 launch uas_bringup uas_stack.launch.py mission_mode:=rectangle
 
 1. M1: Driver publishes telemetry only.
 2. M2: Driver executes manual command services.
-3. M3: Rectangle planner integrated and executable.
-4. M4: SMACC2 FCND-equivalent orchestration complete.
-5. M5: Star and patrol mission modes complete.
+3. M3: Sensor + Perception layers integrated with planning scene.
+4. M4: Route/Prediction/Behavior/Trajectory planning layers integrated.
+5. M5: Control layer + SMACC2 FCND-equivalent orchestration complete.
 6. M6: Fault handling, tests, and documentation complete.
 
 ## 11. Common Integration Pitfalls
@@ -2213,6 +2557,8 @@ ros2 launch uas_bringup uas_stack.launch.py mission_mode:=rectangle
 3. Race conditions from asynchronous callbacks.
 4. Missing watchdog timeout behavior.
 5. Tight coupling of mission logic to MAVLink parsing.
+6. Stale planning scene or robot state monitor causing invalid trajectories.
+7. Missing prediction stage leading to unsafe behavior in dynamic scenes.
 
 Mitigation: centralize conversion, isolate adapter layer, and route mission transitions through explicit events.
 

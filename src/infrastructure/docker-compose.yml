@@ -1,0 +1,13 @@
+services:
+  ros2_uas_dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ros2_uas_dev
+    tty: true
+    stdin_open: true
+    network_mode: host
+    environment:
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    volumes:
+      - /home/ubuntu/src/FCND-Backyard-UAS-Flyer:/opt/ws/src/FCND-Backyard-UAS-Flyer
