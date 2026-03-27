@@ -59,6 +59,26 @@ Implication for ROS2:
 - MoveIt2 contributes mature planning/execution patterns and action-based workflows; for a free-flying UAS in open air, MoveIt2 is optional for core flight control but valuable for future multi-agent, obstacle-aware, or manipulator-carrying UAS scenarios.
 - SMACC2 is a strong fit for this problem because FCND is naturally an event-driven finite state machine and SMACC2 provides compile-time checked transitions and reusable client behaviors.
 
+### 2.4 Current Implementation Status (March 2026)
+
+The current `udacidrone_driver_cpp` implementation has established the following stack decisions and constraints:
+
+- MAVLink translator uses a guarded include strategy:
+	- Prefer `mavlink/v2.0/mavlink.h` with `MAVLINK_DIALECT` set to `common`.
+	- Fallback to `mavlink/v2.0/common/mavlink.h`, `mavconn/mavlink_dialect.hpp`, and other compatible include paths.
+	- Apply `#undef MAVLINK_VERSION` before including `mavros_msgs/mavlink_convert.hpp` to avoid C/C++ macro collisions.
+- MAVLink APIs are consumed as C-style global symbols/macros (for example `mavlink_msg_command_long_pack`, `MAV_CMD_*`, `MAVLINK_MSG_ID_*`), not as `mavlink::` members.
+- `mavlink_msg_set_position_target_local_ned_pack` must include the `time_boot_ms` argument for the Jazzy header signature.
+- Build dependencies are explicitly declared and validated in the driver package:
+	- CMake: `mavlink`, `mavros_msgs`, `libmavconn`
+	- package.xml: `mavlink`, `mavros_msgs`, `libmavconn`
+- Linkage should rely on `ament_target_dependencies(... libmavconn)` and should not hardcode `target_link_libraries(... mavconn)` unless the raw linker name is known to exist.
+- Driver behavior parity note:
+	- Component ID is fixed to `191` (onboard computer).
+	- `cmdPosition` applies simulator/PX4 down-axis sign handling via `is_px4` mode.
+
+Build note: MAVLink generated-header warnings about packed members are expected under `-Wpedantic` and are non-fatal unless warnings are promoted to errors.
+
 ## 3. Problem Statement
 
 Design and implement a modular ROS2 C++ backend application that can command and monitor a Unity3D UAS simulator by creating a ROS2-native equivalent of the UdaciDrone API, then build mission workflows on top of that driver using SMACC2.
@@ -331,6 +351,9 @@ Recommended test levels:
 4. Tight coupling between mission logic and transport layer.
 	- Mitigation: strict ROS2 interface contract and package boundaries.
 
+5. Link-time mismatch on libmavconn symbol naming (`-lmavconn` vs exported package interface).
+	- Mitigation: avoid hardcoded `target_link_libraries(... mavconn)` and rely on `ament_target_dependencies(... libmavconn)` exported linkage.
+
 ## 13. Deliverables
 
 1. ROS2 C++ UdaciDrone-compatible driver package.
@@ -352,7 +375,8 @@ The effort is complete when:
 ## 15. Immediate Next Implementation Actions
 
 1. Scaffold the ROS2 workspace and the six packages listed in Section 6.1.
-2. Implement and test only Phase 1 command/telemetry loop first.
-3. Add rectangle mission in SMACC2 to match FCND before adding star/patrol.
-4. Freeze interface contracts, then scale to additional mission modes.
+2. Preserve the current MAVLink translator integration constraints from Section 2.4 while extending features.
+3. Implement and test only Phase 1 command/telemetry loop first.
+4. Add rectangle mission in SMACC2 to match FCND before adding star/patrol.
+5. Freeze interface contracts, then scale to additional mission modes.
 
