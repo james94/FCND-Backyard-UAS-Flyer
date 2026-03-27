@@ -167,7 +167,7 @@ dpkg -l | grep -E "ros-jazzy-(mavlink|mavros|mavros-msgs|libmavconn)"
 ls /opt/ros/jazzy/include/mavros_msgs/mavlink_convert.hpp
 ```
 
-Note: Some Jazzy images do not expose `mavlink/v2.0/common/mavlink.h` on the default include path. The driver implementation should rely on `mavros_msgs/mavlink_convert.hpp` and `libmavconn` headers instead of directly including `mavlink.h`.
+Note: MAVLink header layouts vary across Jazzy images. Use a guarded include strategy in the translator (`mavlink/v2.0/mavlink.h` with `MAVLINK_DIALECT common`, then fallback paths), followed by `#undef MAVLINK_VERSION` before including `mavros_msgs/mavlink_convert.hpp`.
 Important: avoid including `mavros/mavros_uas.hpp` in low-level driver translation units unless you explicitly need MAVROS UAS helpers. That header transitively depends on `tf2_ros/buffer.hpp`. If you do include it, ensure `tf2_ros` is installed and added to package dependencies.
 
 ## 2. Architecture Translation from Problem Statement
@@ -670,7 +670,7 @@ mavros_msgs::msg::Mavlink encodeCommandLong(
 	float p7 = 0.0F)
 {
 	mavlink::mavlink_message_t msg;
-	::mavlink_msg_command_long_pack(
+	mavlink_msg_command_long_pack(
 		kSysId,
 		kCompId,
 		&msg,
@@ -700,7 +700,7 @@ mavros_msgs::msg::Mavlink encodeSetPositionTarget(
 	float yaw_rate)
 {
 	mavlink::mavlink_message_t msg;
-	::mavlink_msg_set_position_target_local_ned_pack(
+	mavlink_msg_set_position_target_local_ned_pack(
 		kSysId,
 		kCompId,
 		&msg,
@@ -741,7 +741,7 @@ bool MavlinkTranslator::decode(const mavros_msgs::msg::Mavlink &msg)
 		case MAVLINK_MSG_ID_HEARTBEAT:
 		{
 			mavlink_heartbeat_t hb;
-			::mavlink_msg_heartbeat_decode(&wire, &hb);
+			mavlink_msg_heartbeat_decode(&wire, &hb);
 
 			state_.stamp_sec = 0.0;
 			state_.armed = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
@@ -754,7 +754,7 @@ bool MavlinkTranslator::decode(const mavros_msgs::msg::Mavlink &msg)
 		case MAVLINK_MSG_ID_LOCAL_POSITION_NED:
 		{
 			mavlink_local_position_ned_t lp;
-			::mavlink_msg_local_position_ned_decode(&wire, &lp);
+			mavlink_msg_local_position_ned_decode(&wire, &lp);
 			const double t = static_cast<double>(lp.time_boot_ms) / 1000.0;
 
 			position_.stamp_sec = t;
@@ -773,7 +773,7 @@ bool MavlinkTranslator::decode(const mavros_msgs::msg::Mavlink &msg)
 		case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
 		{
 			mavlink_global_position_int_t gp;
-			::mavlink_msg_global_position_int_decode(&wire, &gp);
+			mavlink_msg_global_position_int_decode(&wire, &gp);
 			const double t = static_cast<double>(gp.time_boot_ms) / 1000.0;
 
 			position_.stamp_sec = t;
