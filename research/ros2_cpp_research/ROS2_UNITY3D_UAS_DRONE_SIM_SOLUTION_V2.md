@@ -1731,11 +1731,30 @@ ament_target_dependencies(uas_driver_node
 	libmavconn)
 
 install(TARGETS uas_driver_node DESTINATION lib/${PROJECT_NAME})
+
+# Required so `ros2 launch udacidrone_driver_cpp ...` can find launch scripts
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+
+# Optional but recommended for parameter profiles used by launch
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 ```
 
 Linking note: do not add `target_link_libraries(uas_driver_node mavconn)` on Jazzy unless you have verified that raw library name exists on the linker path. `ament_target_dependencies(... libmavconn)` is the portable way because it uses the package-exported link interface.
 
 If you keep the translator implementation above, install `ros-jazzy-mavlink`, `ros-jazzy-mavros-msgs`, and `ros-jazzy-libmavconn` in your dev image.
+
+Launch deployment sanity checklist:
+
+1. Keep executable names consistent across CMake, `ros2 run`, and launch files:
+	- CMake target/executable: `uas_driver_node`
+	- Launch `Node(executable=...)`: `uas_driver_node`
+2. Rebuild after launch/CMake changes:
+	- `colcon build --packages-select udacidrone_driver_cpp --symlink-install`
+	- `source install/setup.bash`
+3. Verify package install tree contains launch files:
+	- `ls install/udacidrone_driver_cpp/share/udacidrone_driver_cpp/launch`
+4. Verify ROS can discover launch files:
+	- `ros2 launch udacidrone_driver_cpp --show-arguments`
 
 ### 4.1.9 Launch Arguments and Bringup Modes (UR-Style)
 
@@ -1969,6 +1988,106 @@ Where telemetry is recorded:
 3. Live verification: `ros2 topic echo /uas/global_position` and `ros2 topic echo /uas/local_position`.
 
 This gives you the same practical validation loop as UdaciDrone manual-flight logging, but with ROS2-native typed logs that can be replayed using `ros2 bag play`.
+
+### 4.1.13 Unity Manual-Control Telemetry Runbook (Operator Flow)
+
+Use this exact sequence when you want to manually fly in Unity and observe/record telemetry from the C++ ROS2 driver.
+
+Terminal A (build and source):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
+colcon build --packages-select udacidrone_driver_cpp --symlink-install
+source install/setup.bash
+```
+
+Terminal B (launch driver + rosbag2 capture):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
+source install/setup.bash
+
+ros2 launch udacidrone_driver_cpp udacidrone_driver.launch.py \
+	connection_uri:=tcp:127.0.0.1:5760 \
+	is_px4:=false \
+	use_mock_sim:=false \
+	launch_session_manager:=true \
+	start_external_control_on_boot:=false \
+	record_telemetry:=true \
+	telemetry_record_mode:=rosbag2 \
+	telemetry_output_dir:=/tmp/uas_logs \
+	telemetry_run_id:=manual_flight
+```
+
+Terminal C (live telemetry monitor while manually piloting in Unity):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
+source install/setup.bash
+
+ros2 topic echo /uas/driver_health
+```
+
+Terminal D (position stream):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
+source install/setup.bash
+
+ros2 topic echo /uas/local_position
+```
+
+Terminal E (velocity stream):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
+source install/setup.bash
+
+ros2 topic echo /uas/local_velocity
+```
+
+Terminal F (global position stream):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/ws/src/FCND-Backyard-UAS-Flyer/cpp/uas_stack
+source install/setup.bash
+
+ros2 topic echo /uas/global_position
+```
+
+Optional rate checks:
+
+```bash
+ros2 topic hz /uas/local_position
+ros2 topic hz /uas/local_velocity
+```
+
+Post-flight recording verification:
+
+```bash
+ls -lah /tmp/uas_logs/manual_flight
+ros2 bag info /tmp/uas_logs/manual_flight
+```
+
+Replay captured telemetry:
+
+```bash
+ros2 bag play /tmp/uas_logs/manual_flight
+```
+
+If no telemetry appears during manual flight:
+
+1. Confirm Unity simulator is running and bound to `tcp:127.0.0.1:5760`.
+2. Confirm driver is not in mock mode (`use_mock_sim:=false`).
+3. Check `/uas/driver_health` for timeout/degraded status.
+4. Confirm launch file discovery with `ros2 launch udacidrone_driver_cpp --show-arguments`.
+5. Confirm launch files are installed in package share directory after build.
 
 ## 4.2 uas_mission_core Class Model
 
